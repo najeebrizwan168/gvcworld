@@ -1,0 +1,1375 @@
+/* ============================================================================
+   GVCW — Book Appointment (/appointments/add)
+   Source: https://pk-gr-services.gvcworld.eu/dist/css/app.css
+   283 rules matching classes/ids used inside <form id="appointment">
+   Extracted from live CSSOM (values are computed/normalised by the browser).
+   ============================================================================ */
+
+#main-area.dashboard {
+    font-size: 0px;
+}
+
+/* ---------- select2 skin ------------------------------------------------- */
+
+.select2 {
+    font-size: 14px;
+    width: 100% !important;
+}
+form.changed .select2 {
+    background-color: rgb(255, 255, 182);
+}
+.select2 .select2-selection {
+    font-size: 16px;
+    min-height: 40px;
+    height: auto;
+    opacity: 0.7;
+    border: 2px solid rgb(207, 207, 207);
+    outline: none medium;
+    background-color: rgb(250, 250, 250);
+    transition: 0.3s;
+}
+.select2 .select2-selection > span {
+    line-height: 36px !important;
+}
+.form-item.h30 .select2 .select2-selection {
+    min-height: 30px;
+}
+select.parsley-error ~ .select2 .select2-selection,
+select.parsley-error ~ .select2 .select2-selection .select2-selection__arrow {
+    border-color: rgb(202, 48, 48) !important;
+}
+select.parsley-error ~ .select2-container--default .select2-selection--single .select2-selection__arrow b {
+    border-color: rgb(202, 48, 48) transparent transparent;
+}
+select.parsley-error ~ .select2-container--default.select2-container--open .select2-selection--single .select2-selection__arrow b {
+    border-color: transparent transparent rgb(202, 48, 48);
+}
+.select2-container .select2-selection:focus,
+.select2-container--open .select2-selection,
+.select2 .select2-selection:hover {
+    opacity: 1;
+}
+.select2-container .select2-selection:focus {
+    background-color: transparent;
+}
+.select2-container--default.select2-container--disabled .select2-selection {
+    cursor: no-drop;
+    opacity: 0.4 !important;
+}
+.select2-container--default.select2-container--disabled .select2-selection:focus {
+    background-color: rgb(238, 238, 238);
+}
+form.changed .select2-container--open .select2-selection,
+form.changed .select2 .select2-selection:hover {
+    background-color: rgb(255, 255, 182);
+}
+.select2-container--default.select2-container--focus .select2-selection--multiple {
+    border: 2px solid rgb(207, 207, 207);
+}
+.select2-dropdown {
+    z-index: 13;
+    background-color: rgb(250, 250, 250);
+}
+.select2-container--open .select2-dropdown {
+    border: 2px solid rgb(207, 207, 207);
+}
+.select2-container--open .select2-dropdown--below {
+    font-size: 15px;
+    border-top-width: medium;
+    border-top-style: none;
+    border-top-color: currentcolor;
+}
+.select2-container--open .select2-dropdown--above {
+    border-bottom-width: medium;
+    border-bottom-style: none;
+    border-bottom-color: currentcolor;
+}
+.select2 .select2-selection .select2-selection__arrow {
+    height: 38px;
+    border-left: 2px solid rgb(207, 207, 207);
+}
+.form-item.h30 .select2 .select2-selection .select2-selection__arrow {
+    height: 28px;
+}
+.select2-search__field {
+    font-size: 14px;
+    outline: none medium;
+}
+.select2-container--default .select2-selection--single .select2-selection__clear {
+    margin-right: 3px;
+}
+
+/* ---------- query builder ------------------------------------------------ */
+
+.query-builder .group-conditions label.active {
+    background-color: rgb(2, 65, 109);
+}
+.query-builder .btn-success {
+    background-color: rgb(30, 118, 30);
+    margin-right: 3px;
+}
+.query-builder .btn-danger {
+    background-color: rgb(132, 9, 9);
+}
+
+/* ---------- date picker wrapper ------------------------------------------ */
+
+.dpicker {
+    position: relative;
+}
+.dpicker i.fa-calendar-alt {
+    position: absolute;
+    top: 34px;
+    right: 10px;
+    font-size: 22px;
+}
+.dpicker input[type="text"] {
+    padding-right: 35px;
+}
+
+/* ---------- visibility toggle -------------------------------------------- */
+
+.hidden {
+    display: none !important;
+}
+
+/* ---------- buttons / wrappers ------------------------------------------- */
+
+.button-wrapper .btn {
+    margin-right: 7px;
+}
+#button-wrapper-outer .btn {
+    display: block;
+    width: 100%;
+    max-width: 250px;
+    margin: 0px auto 7px;
+}
+
+/* ---------- form items --------------------------------------------------- */
+
+.form-item {
+    position: relative;
+    margin-bottom: 20px;
+}
+.form-item.flex {
+    display: flex;
+    align-items: center;
+}
+.form-item.flex > * {
+    margin-right: 35px;
+}
+.form-item.flex > :last-child {
+    margin-right: 0px;
+}
+.form-item.required input {
+    background-color: rgb(255, 235, 205);
+}
+.form-item.required textarea {
+    background-color: rgb(255, 235, 205);
+}
+.form-item.required select {
+    background-color: rgb(255, 235, 205);
+}
+.form-item.required label::after {
+    content: " *";
+}
+.form-item.required span {
+    background-color: rgb(255, 235, 205);
+}
+.form-item.loading label::after {
+    content: " - Loading...";
+    color: rgb(56, 174, 217);
+}
+.form-item.semirequired input {
+    background-color: rgb(191, 255, 207);
+}
+.form-item.semirequired span {
+    background-color: rgb(191, 255, 207);
+}
+
+/* ---------- form controls ------------------------------------------------ */
+
+.form-control {
+    font-size: 16px;
+    height: 40px;
+    padding-left: 5px;
+    border: 2px solid rgb(207, 207, 207);
+    border-radius: 3px;
+    background-color: rgb(250, 250, 250);
+    opacity: 0.7;
+    outline: none medium;
+    transition: 0.3s;
+}
+form.classic .form-control[type="radio"] {
+    display: inline-block;
+    vertical-align: baseline;
+    width: auto;
+    height: auto;
+    margin-right: 10px;
+}
+.form-control[type="radio"] ~ label {
+    display: inline-block;
+    vertical-align: middle;
+    height: auto;
+    margin-bottom: 8px;
+}
+body.touch-device .form-control {
+    border: 2px solid rgb(169, 169, 169);
+}
+.form-control:hover,
+.form-control:focus {
+    opacity: 1;
+}
+.form-control.error {
+    border: 2px solid rgb(132, 9, 9);
+}
+.form-item-help {
+    font-size: 12px;
+    margin-top: 5px;
+    color: rgb(174, 174, 174);
+}
+input[type="checkbox"].form-control ~ label {
+    display: inline-block;
+    vertical-align: middle;
+    margin-bottom: 0px;
+}
+input[type="checkbox"].form-control {
+    display: inline-block;
+    vertical-align: middle;
+    height: auto;
+    width: 25px !important;
+}
+.form-control[disabled] {
+    opacity: 0.4;
+    cursor: no-drop;
+    background-color: rgb(238, 238, 238);
+    border-color: rgb(207, 207, 207);
+}
+.form-control[readonly] {
+    opacity: 0.4;
+    cursor: no-drop;
+    background-color: rgb(238, 238, 238);
+    border-color: rgb(207, 207, 207);
+}
+textarea.form-control {
+    height: 50px;
+    padding-top: 3px;
+}
+.form-control.tc {
+    padding-left: 0px;
+}
+.form-control.parsley-error {
+    border-color: rgb(202, 48, 48) !important;
+}
+
+/* ---------- parsley validation errors ------------------------------------ */
+
+ul.parsley-errors-list {
+    z-index: 1;
+    position: absolute;
+    font-size: 12px;
+    text-align: center;
+    color: white;
+    list-style: none;
+    margin: 7px 0px 0px;
+    padding: 5px 10px;
+    left: 0px;
+    background-color: rgba(202, 48, 48, 0.7);
+    border-radius: 3px;
+    opacity: 0;
+    visibility: hidden;
+}
+form.classic ul.parsley-errors-list {
+    top: 50px;
+}
+body.bg-tech ul.parsley-errors-list {
+    background-color: rgba(129, 45, 45, 0.7);
+}
+.form-item.nolabel ul.parsley-errors-list {
+    top: 35px !important;
+}
+ul.parsley-errors-list.filled {
+    opacity: 1;
+    visibility: visible;
+}
+ul.parsley-errors-list::after {
+    border-bottom: 5px solid rgb(202, 48, 48);
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    content: "";
+    position: absolute;
+    top: -5px;
+    left: calc(50% - 3px);
+    opacity: 0.7;
+}
+body.bg-tech ul.parsley-errors-list::after {
+    border-bottom: 5px solid rgb(129, 45, 45);
+}
+body.front ul.parsley-errors-list.filled {
+}
+
+/* ---------- fieldsets ---------------------------------------------------- */
+
+form.classic fieldset.fieldset-wrapper .table .form-item {
+    display: table-cell;
+    vertical-align: bottom;
+    width: auto;
+    margin: 0px;
+    padding-right: 20px;
+}
+form.classic fieldset.fieldset-wrapper .table .form-item:last-child {
+    padding-right: 0px;
+}
+form.classic fieldset.fieldset-wrapper .table .form-item .btn {
+    white-space: nowrap;
+    width: 100%;
+}
+fieldset.fieldset-wrapper .btn {
+    display: inline-block;
+}
+fieldset.fieldset-wrapper > .form-item:last-child {
+    margin-bottom: 10px;
+}
+.form-item.field-group .field-group-inner {
+    margin-bottom: 7px;
+}
+.form-item.field-group .field-group-inner:last-child {
+    margin-bottom: 0px;
+}
+
+/* ---------- .btn --------------------------------------------------------- */
+
+.btn {
+    font-size: 13px;
+    color: rgb(255, 255, 255);
+    height: 32px;
+    line-height: 33px;
+    padding: 0px 10px;
+    background-color: rgb(211, 211, 211);
+    border-width: medium;
+    border-style: none;
+    border-color: currentcolor;
+    border-image: none;
+    outline: none medium;
+    display: inline-block;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 1;
+    transition: 0.3s;
+}
+.btn.big {
+    font-size: 15px;
+    height: 40px;
+    line-height: 40px;
+}
+.btn:focus,
+.btn:hover {
+    opacity: 0.85;
+    text-decoration: none;
+}
+.btn.small {
+    height: 25px;
+    line-height: 25px;
+    padding: 0px 15px;
+}
+.btn.xsmall {
+    height: 20px;
+    line-height: 20px;
+    padding: 0px 5px;
+}
+.btn.green {
+    background-color: rgb(22, 137, 93);
+}
+.btn.blue {
+    background-color: rgb(56, 174, 217);
+}
+.btn.darkblue {
+    background-color: rgb(129, 160, 182);
+}
+.btn.warning {
+    background-color: rgb(150, 109, 72);
+}
+.btn.red {
+    background-color: rgb(176, 8, 8);
+}
+.btn.darkred {
+    background-color: rgb(132, 9, 9);
+}
+.btn[disabled="disabled"] {
+    opacity: 1;
+    cursor: no-drop;
+    background-color: rgb(209, 209, 209);
+}
+.btn.disabled {
+    opacity: 1;
+    cursor: no-drop;
+    background-color: rgb(209, 209, 209);
+}
+.btn.loading,
+.icon-wrapper.loading {
+    position: relative;
+    cursor: progress;
+    opacity: 1;
+    background-color: rgb(191, 191, 191) !important;
+}
+.btn.loading::before,
+.icon-wrapper.loading::before {
+    content: "";
+    position: absolute;
+    top: 0px;
+    left: 0px;
+    width: 0px;
+    height: 3px;
+    background-color: rgb(229, 229, 229);
+    animation: 2s cubic-bezier(0, 0, 0.1, 0.9) 0s 1 normal forwards running line-progress;
+}
+.btn.tab {
+    margin-bottom: 2px;
+    transition: all;
+}
+.btn.tab.active {
+    margin-bottom: -2px;
+    padding-bottom: 30px;
+}
+.btn.tab .arrow {
+    margin-top: 7px;
+}
+.btn.tab.active .arrow {
+    margin-top: 5px;
+}
+.btn.tab .arrow::before,
+.btn.tab .arrow::after {
+    background-color: rgb(255, 255, 255);
+}
+
+/* ---------- form.classic layout ------------------------------------------ */
+
+form.classic .form-item {
+    width: 100%;
+    margin: 0px auto 20px;
+}
+form.classic .form-control {
+    width: 100%;
+}
+form.classic .form-button-wrapper {
+    margin-top: 19px;
+    position: sticky;
+    bottom: 0px;
+    background-color: white;
+    padding: 10px 0px;
+}
+form.classic.one-field .form-item {
+    text-align: left;
+    display: inline-block;
+}
+form.classic.one-field .form-button-wrapper {
+    display: inline-block;
+    vertical-align: top;
+    margin-left: 10px;
+}
+form.classic.col-6 .form-item {
+    display: inline-block;
+    vertical-align: top;
+    width: 48%;
+    margin-right: 4%;
+}
+form.classic.col-6 .form-item:nth-child(2n+1) {
+    margin-right: 0px;
+}
+form.classic.col-6 .form-button-wrapper {
+    margin-left: 0px;
+}
+form.classic .form-button-wrapper .btn {
+    margin-right: 10px;
+}
+form.classic.left,
+form.classic.left .form-item,
+form.classic.left .form-button-wrapper {
+    margin-left: 0px;
+}
+
+/* ---------- misc app chrome ---------------------------------------------- */
+
+#pager nav ul li.active .page-item {
+    color: rgb(255, 255, 255);
+    background-color: rgb(56, 174, 217);
+}
+.action-controller .btn {
+    display: block;
+    margin-bottom: 3px;
+    width: 100%;
+    font-size: 0px;
+    text-align: center;
+}
+.action-controller .btn:last-child {
+    margin-bottom: 0px;
+}
+.action-controller:hover .btn {
+    font-size: 14px;
+}
+#modal #main-area-modal {
+    position: relative;
+    height: 100%;
+    border: 2px solid rgb(237, 237, 237);
+    border-radius: 3px;
+    overflow-y: scroll;
+}
+#modal #main-area-modal.pager {
+    height: calc(100% - 60px);
+}
+#main-area-modal .body {
+    text-align: center;
+    padding: 2%;
+    font-size: 16px;
+}
+#main-area-modal .split {
+    font-size: 0px;
+}
+#main-area-modal .split .split-box {
+    font-size: 13px;
+    width: 50%;
+    display: inline-block;
+    vertical-align: top;
+}
+#main-area-modal .split .split-box > div {
+    margin-bottom: 10px;
+}
+#main-area-modal .split .split-left {
+    border-right: 1px solid rgb(165, 194, 220);
+}
+#main-area-modal .split .split-right {
+    padding-left: 20px;
+}
+#main-area-modal.graph-more-details {
+    background-color: rgb(244, 244, 244);
+}
+#main-area-modal.graph-more-details .fields-wrapper {
+    padding: 8px 0px 7px 8px;
+}
+#main-area-modal.graph-more-details .fields-wrapper > .show-field {
+    margin-bottom: 4px;
+}
+#main-area-modal.graph-more-details .show-more-inner {
+    margin-bottom: 10px;
+}
+#main-area-modal.graph-more-details fieldset .media-info-wrapper ol {
+    margin-left: 20px;
+}
+#header-wrapper .classic-btn:hover,
+#header-wrapper .classic-btn.active {
+    color: rgb(255, 255, 255);
+    background-color: rgb(45, 45, 45);
+}
+#header-wrapper #mini-menu-wrapper .box-field.box-buttons .btn {
+    margin-right: 10px;
+}
+#header-wrapper #mini-menu-wrapper .box-field.box-buttons .btn:last-child {
+    margin-right: 0px;
+}
+.box.dropdown ul li:hover,
+.box.dropdown ul li.active {
+    color: black;
+    background-color: white;
+    padding: 10px 2px 10px 5px;
+}
+.box.dropdown ul li:hover span.flag-icon,
+.box.dropdown ul li.active span.flag-icon {
+    right: 5px;
+}
+main.cc form .form-item {
+    font-family: FontAwesome;
+}
+main.cc form .form-item i {
+    color: rgb(45, 45, 45);
+}
+main.cc form .btn {
+    font-size: 14px;
+    margin-top: 20px;
+}
+main.cc form .btn:first-child {
+}
+.filter-wrapper form .form-item {
+    font-size: 14px;
+    display: inline-block;
+    vertical-align: top;
+    margin-right: 10px;
+    margin-bottom: 5px;
+}
+.filter-wrapper form .form-item span.select2-selection {
+    padding-right: 10px;
+}
+.filter-wrapper form .form-button-wrapper {
+    margin-top: 5px;
+}
+.filter-wrapper .form-control {
+    font-size: 14px;
+}
+.filter-wrapper .btn {
+    margin-right: 4px;
+}
+
+/* ---------- #main-area --------------------------------------------------- */
+
+#main-area {
+    position: relative;
+    margin-top: 20px;
+    margin-bottom: 30px;
+    border-radius: 3px;
+    background-color: rgb(255, 255, 255);
+    box-shadow: rgb(220, 220, 220) 0px 0px 15px 0px;
+}
+#main-area .body {
+    padding: 60px;
+    text-align: center;
+    font-size: 16px;
+}
+#main-area .body.small {
+    padding: 20px 60px;
+    background-color: rgb(243, 243, 243);
+}
+#main-area.sections {
+    border-width: medium;
+    border-style: none;
+    border-color: currentcolor;
+    border-image: none;
+    background-color: transparent;
+    box-shadow: none;
+}
+#main-area.sections section {
+    background-color: rgb(250, 250, 250);
+    margin-bottom: 30px;
+    padding-bottom: 2%;
+}
+#main-area.sections section.chart {
+    margin-bottom: 0px;
+    padding-bottom: 0px;
+}
+#main-area.sections #inline-sections {
+    display: table;
+    width: 100%;
+}
+#main-area.sections #inline-sections section {
+    display: table-cell;
+    vertical-align: top;
+    width: 33.3%;
+}
+#main-area.sections #inline-sections section:last-child {
+    margin-right: 0px;
+}
+#main-area.sections section h2 {
+    font-size: 18px;
+    color: rgb(2, 71, 116);
+    border-bottom: 1px solid rgb(237, 237, 237);
+    background-color: rgb(250, 250, 250);
+    font-weight: 400;
+    padding: 12px 0px;
+    margin: 0px 2%;
+}
+#main-area.sections section.chart h2 {
+    margin: 0px;
+}
+#main-area.sections .inner-section {
+    width: 96%;
+    padding: 10px;
+    margin: 2% auto 0px;
+    border: 1px solid rgb(234, 234, 234);
+    background-color: white;
+}
+#main-area.sections .inner-section.table-wrapper {
+    padding: 0px;
+}
+#main-area.report-item .classification span.tags {
+    display: inline-block;
+    margin-top: 5px;
+    padding: 3px 5px;
+    background-color: rgb(219, 232, 244);
+}
+#dg-report svg g.nodes circle.active {
+    fill: rgb(56, 174, 217);
+    stroke: black;
+    stroke-width: 2px;
+}
+#filters-wrapper .form-control {
+    width: 100%;
+}
+#tip-selector-actions > .btn {
+    margin-right: 5px;
+}
+#tip-selector-actions > .btn:last-child {
+    margin-right: 0px;
+}
+#tabs .tab a:hover,
+#tabs .tab a.active {
+    color: rgb(181, 187, 193);
+    text-decoration: none;
+    background-color: rgb(45, 45, 45);
+}
+
+/* ---------- #split-main / #form-tabs (the day tabs) ---------------------- */
+
+#split-main {
+    position: relative;
+}
+#form-tabs {
+    position: sticky;
+    top: 70px;
+    display: inline-block;
+    vertical-align: top;
+    width: 200px;
+    margin-top: 20px;
+    margin-bottom: 30px;
+    padding: 30px 0px;
+    border-radius: 3px;
+    background-color: rgb(255, 255, 255);
+    box-shadow: rgb(220, 220, 220) 0px 0px 15px 0px;
+}
+#form-tabs ul {
+    font-size: 15px;
+    list-style: none;
+}
+#form-tabs ul li {
+    padding: 5px 25px 5px 5px;
+    cursor: pointer;
+    position: relative;
+    border-bottom: 1px solid black;
+}
+#form-tabs ul li:first-child {
+    border-top: 1px solid black;
+}
+#form-tabs ul li:hover,
+#form-tabs ul li.active {
+    background-color: rgb(45, 45, 45);
+    color: rgb(255, 255, 255);
+}
+#form-tabs ul li.disabled {
+    opacity: 1;
+    cursor: no-drop;
+    background-color: rgb(209, 209, 209);
+}
+#form-tabs ui li span.menu-label {   /* sic — "ui" typo in source */
+    display: block;
+}
+#form-tabs ul li span.errors-num:empty {
+    display: none;
+}
+#form-tabs ul li span.errors-num {
+    position: absolute;
+    top: 6px;
+    right: 5px;
+    color: white;
+    border-radius: 15px;
+    background-color: rgb(202, 48, 48);
+    display: block;
+    width: 15px;
+    height: 15px;
+    line-height: 15px;
+    text-align: center;
+    font-size: 11px;
+}
+#split-main #main-area {
+    display: inline-block;
+    width: calc(100% - 219px);
+    vertical-align: top;
+    margin-left: 15px;
+}
+
+/* ---------- sidebar ------------------------------------------------------ */
+
+#layout-sidebar-first #menu > ul > li.active > a,
+#layout-sidebar-first #menu > ul > li > a:hover {
+    color: rgb(56, 174, 217);
+    background-color: rgb(255, 255, 255);
+}
+#layout-sidebar-first #menu ul ul li.active a,
+body.no-touch #layout-sidebar-first #menu ul ul a:hover {
+    color: rgb(56, 174, 217);
+}
+#layout-sidebar-first #menu ul ul li.active a::after,
+body.no-touch #layout-sidebar-first #menu ul ul li a:hover::after {
+    width: 60%;
+}
+
+/* ---------- MRZ / required ----------------------------------------------- */
+
+.mrz.required label::after {
+    content: " *";
+}
+.mrz.required input {
+    background-color: rgb(255, 235, 205);
+}
+.mrz.required span {
+    background-color: rgb(255, 235, 205);
+}
+.resetrequired {
+    background-color: rgb(255, 255, 255) !important;
+}
+
+/* ============================================================================
+   APPOINTMENT-SPECIFIC  ←←← the important part for scraping
+   ============================================================================ */
+
+.appointment_box_tip {
+    color: rgb(255, 255, 255);
+    background-color: rgb(70, 130, 180);
+    padding: 10px;
+    margin-bottom: 25px;
+    border: 1px dotted;
+}
+.appointment_subtitle {
+    padding: 15px 0px 20px;
+    text-align: center;
+}
+.appointment_tip {
+    color: rgb(90, 114, 142);
+    font-weight: 700;
+    margin-bottom: 5.5px;
+    text-align: center;
+}
+.appointment_box {
+    border: 2px solid rgb(207, 207, 207);
+    border-radius: 3px;
+    padding: 10px;
+}
+
+/* --- alert banners --- */
+
+.appointment_alert {
+    padding: 0.75rem 1.25rem;
+    margin-bottom: 1rem;
+    border: 1px solid transparent;
+    border-radius: 0.25rem;
+}
+.appointment_alert-danger {
+    color: rgb(114, 28, 36);
+    background-color: rgb(248, 215, 218);
+    border-color: rgb(245, 198, 203);
+}
+.appointment_alert-success {
+    background-color: rgb(212, 237, 218);
+    border-color: rgb(212, 237, 218);
+}
+.appointment_alert-warning {
+    background-color: rgb(255, 243, 205);
+    border-color: rgb(255, 243, 205);
+    color: rgb(133, 100, 4);
+}
+
+/* --- TIME SLOT STATES -----------------------------------------------------
+   These five modifier classes are the state machine for the slot grid
+   rendered into #resultDiv. Match on them to detect availability:
+
+     .appointment_slot_enabled         → FREE, clickable        (green outline)
+     .appointment_slot_selected        → your current pick      (green fill)
+     .appointment_slot_notselectable   → free but not pickable  (grey fill)
+     .appointment_slot_reserved        → held/reserved          (grey fill)
+     .appointment_slot_disabled        → taken / unavailable    (dark red)
+   -------------------------------------------------------------------------- */
+
+.appointment_slot {
+    padding: 5px 1px;
+    margin: 5px 10px;
+    font-weight: bold;
+    width: 45px;
+    height: 30px;
+}
+.appointment_slot_enabled {
+    border: 2px solid rgb(34, 188, 102);
+    background-color: transparent;
+    color: rgb(34, 188, 102);
+    cursor: pointer;
+}
+.appointment_slot_notselectable {
+    border: 2px solid rgb(34, 188, 102);
+    background-color: rgb(209, 209, 209);
+    color: rgb(34, 188, 102);
+}
+.appointment_slot_selected {
+    border: 2px solid rgb(34, 188, 102);
+    background-color: rgb(34, 188, 102);
+    color: rgb(255, 255, 255);
+}
+.appointment_slot_disabled {
+    border: 2px solid rgb(119, 56, 56);
+    background: rgb(209, 209, 209);
+    color: rgb(255, 255, 255);
+}
+.appointment_slot_reserved {
+    border: 2px solid rgb(34, 188, 102);
+    background-color: rgb(209, 209, 209);
+    color: rgb(255, 255, 255);
+    padding: 10px 15px;
+}
+
+.locked-tag .select2-selection__choice__remove {
+    display: none !important;
+    content: "";
+}
+.select2-results__option[aria-selected="true"] {
+    display: none;
+    content: "";
+}
+.requiredDiv {
+    background-color: rgb(255, 235, 205);
+}
+
+/* ---------- landing page buttons ----------------------------------------- */
+
+#landing .btn:link,
+#landing .btn:visited {
+    display: inline-block;
+    text-transform: uppercase;
+    text-decoration: none;
+    padding: 0.5rem 3rem;
+    border-radius: 1rem;
+    position: relative;
+    font-size: 1.8rem;
+    transition: 0.2s;
+}
+#landing .btn--yellow {
+    background-color: rgb(230, 173, 30);
+    border: 1px solid rgb(230, 173, 30);
+    color: rgb(255, 255, 255);
+    font-weight: bold;
+    text-decoration: none;
+}
+#landing .btn--yellow:hover,
+#landing .btn--yellow:active {
+    background-color: rgb(209, 157, 24);
+    border: 1px solid rgb(209, 157, 24);
+    color: rgb(255, 255, 255);
+    font-weight: bold;
+    text-decoration: none;
+}
+#landing .btn--navigation {
+    font-size: 1rem;
+    padding: 0.5rem 2rem !important;
+}
+.btn--navigation:hover {
+    background-color: rgb(209, 157, 24) !important;
+    border: 1px solid rgb(209, 157, 24) !important;
+}
+.btn--apply {
+    font-size: 1rem;
+    padding: 0.4rem 1.2rem !important;
+}
+
+/* ============================================================================
+   RESPONSIVE
+   ============================================================================ */
+
+@media screen and (max-width: 1200px) {
+    .btn.warning {
+        background-color: rgb(77, 150, 72);
+    }
+    #btn-search {
+        height: 40px;
+        margin: 0px;
+        width: 200px;
+    }
+    #publicHoliday .form-button-wrapper .btn {
+        width: 100px;
+    }
+    form.classic .form-button-wrapper .btn {
+        margin: 10px 10px 0px 0px;
+    }
+    #appointment.classic .form-button-wrapper {
+        margin: 12px;
+        position: static;
+        background-color: transparent;
+    }
+    fieldset.fieldset-wrapper .form-item {
+        padding-left: 20px;
+    }
+    .select2 .select2-selection,
+    .form-control {
+        border: 1px solid rgb(207, 207, 207) !important;
+    }
+    .select2-container--default .select2-selection--single .select2-selection__clear {
+        margin-right: 10px;
+    }
+    .dpicker i.fa-calendar-alt,
+    .tpicker i.fa-clock {
+        position: static;
+        right: 10px;
+        transform: translate(-10px, -32px);
+        font-size: 22px;
+        height: 0px;
+        display: flex;
+        justify-content: flex-end;
+        top: 70% !important;
+    }
+    #form-tabs {
+        padding: 0px;
+    }
+    .appointment_box #form-tabs ul {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        padding: 5px;
+    }
+    #form-tabs ul li {
+        padding: 10px 25px 10px 5px;
+        border-bottom: 1px solid rgb(221, 221, 221) !important;
+    }
+    .appointment_box #form-tabs ul li:nth-child(2n-1) {
+        border-right: 1px solid;
+    }
+    #form-tabs ul li:first-child {
+        border-top-width: medium;
+        border-top-style: none;
+        border-top-color: currentcolor;
+    }
+    #form-tabs ul li:last-child {
+        border-bottom: 0px !important;
+    }
+    .filter-wrapper form .form-button-wrapper {
+        margin-bottom: 5px;
+        display: flex;
+        align-items: flex-end;
+    }
+    .filter-wrapper .btn#btn-reset {
+        margin: 0px;
+    }
+    .filter-wrapper .btn,
+    .form-button-wrapper .btn {
+        height: 40px;
+    }
+    #groupTable {
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 100% !important;
+    }
+    #appointment table:is(#groupTable) tbody > tr > td,
+    #appointment table:is(#groupTable) thead > tr > th {
+        padding: 8px 8px 8px 0px;
+        text-align: left;
+        color: black;
+        font-weight: 400;
+    }
+    #appointment.classic #groupTable .form-control {
+        width: 200px;
+    }
+    #appointment table:first-of-type td {
+        padding-bottom: 5px;
+    }
+    #groupTable,
+    #appointment table {
+        overflow-x: auto;
+        display: block;
+        & ::-webkit-scrollbar {
+            width: 12px !important;
+            height: 10px;
+        }
+        & ::-webkit-scrollbar-track {
+            box-shadow: rgba(0, 0, 0, 0.3) 0px 0px 6px inset !important;
+            border-radius: 0px !important;
+        }
+        & ::-webkit-scrollbar-thumb {
+            border-radius: 0px !important;
+            background: rgb(117, 121, 125) !important;
+            box-shadow: rgba(0, 0, 0, 0.5) 0px 0px 6px inset !important;
+        }
+        & ::-webkit-scrollbar-thumb:window-inactive {
+            background: rgb(117, 121, 125) !important;
+        }
+    }
+    #appointment.classic {
+        padding: 30px 30px 300px;
+    }
+    #appointment .dpicker input {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        margin-bottom: 0px;
+    }
+    #appointment_box #form-tabs {
+        position: static;
+        width: 100%;
+    }
+    #appointment_box #main-area {
+        margin-left: 0px;
+        width: 100%;
+    }
+    #appointment_box #main-area > table > tbody {
+        display: inline-block;
+        width: 100%;
+    }
+    #appointment_box #main-area > table > tbody > tr {
+        display: flex;
+        align-items: flex-start;
+        width: 100%;
+    }
+    #appointment_box #main-area > table > tbody > tr > td:nth-of-type(2) {
+        width: 48% !important;
+        margin-left: 2%;
+    }
+    #appointment_box #main-area > table table tbody {
+        display: block;
+        width: 100%;
+    }
+    #appointment_box #main-area > table table tbody tr {
+        display: flex;
+        justify-content: space-between;
+        width: 100%;
+    }
+    #appointment_box .form-button-wrapper {
+        margin: 0px;
+    }
+    #appointment_box h4 {
+        text-align: center;
+    }
+    .appointment_slot_enabled {
+        border-radius: 20px;
+        width: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .info_area div:first-child {
+        margin-bottom: 10px;
+        border: 1px solid rgb(34, 188, 102) !important;
+    }
+    .info_area div:nth-child(2) {
+        border: 1px solid rgb(119, 56, 56) !important;
+        background: white !important;
+        color: rgb(119, 56, 56) !important;
+    }
+    .appointment_slot_disabled {
+        border-radius: 20px;
+        width: 70px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: white;
+        color: rgb(119, 56, 56);
+    }
+    button#btn-new-appointment {
+        width: 100%;
+        height: 50px;
+        max-width: 300px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .appointment_box {
+        border-width: medium;
+        border-style: none;
+        border-color: currentcolor;
+        border-image: none;
+    }
+    #vac.classic #vac-holidays-wrapper .table .form-item {
+        padding: 0px;
+    }
+    #vac .table-wrapper table {
+        margin-bottom: 10px;
+    }
+    #vac.classic #vac-holidays-wrapper .table {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 20px;
+        align-items: flex-end;
+    }
+    #period.classic > .form-button-wrapper {
+        display: flex;
+        flex-wrap: wrap;
+    }
+    #period.classic > .form-button-wrapper > a.btn {
+        display: flex;
+        align-items: center;
+        max-width: 200px;
+        justify-content: center;
+    }
+    #period.classic > .form-button-wrapper > .form-button-wrapper {
+        width: 100%;
+    }
+    #period > .form-button-wrapper > .form-button-wrapper {
+        display: inline-block;
+        margin-bottom: 20px;
+    }
+}
+
+@media screen and (max-width: 1024px) {
+    .form-item td:first-child {
+        padding-left: 0px;
+    }
+    #vac.classic #vac-holidays-wrapper .table {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 768px) {
+    form.classic.col-6 .form-item {
+        width: 100%;
+    }
+    form.classic .form-item {
+        width: 75%;
+        margin-bottom: 15px;
+    }
+    textarea.form-control {
+        height: 90px;
+    }
+    form.classic fieldset.fieldset-wrapper .form-item {
+        display: inline-block;
+        vertical-align: baseline;
+        width: 100%;
+        margin-bottom: 15px;
+        padding-right: 0px;
+    }
+    #form-tabs {
+        position: static;
+        width: 100%;
+    }
+    #split-main #main-area {
+        width: 100%;
+        margin-left: 0px;
+    }
+    form.classic .form-item {
+        width: 100% !important;
+    }
+    .filter-wrapper form .form-item {
+        width: 100%;
+        margin-bottom: 15px;
+    }
+    #publicHoliday .form-button-wrapper .btn {
+        width: 100%;
+    }
+    .filter-wrapper .form-control {
+        width: 100%;
+        padding: 0px 10px;
+    }
+}
+
+@media screen and (max-width: 756px) {
+    #appointment > table:not(#groupTable) tbody > tr > td {
+        display: block;
+        padding: 0px;
+        margin-bottom: 15px;
+        width: 500px !important;
+    }
+    #appointment table {
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 100% !important;
+    }
+    #appointment_box #main-area > table > tbody > tr {
+        flex-direction: column;
+    }
+    #appointment_box #main-area > table > tbody > tr > td {
+        padding: 0px;
+        border-right-width: medium !important;
+        border-right-style: none !important;
+        border-right-color: currentcolor !important;
+    }
+    #appointment_box #main-area > table table tr {
+        display: flex;
+        justify-content: space-between;
+    }
+    #appointment_box #main-area > table > tbody > tr > td:nth-of-type(2) {
+        width: 100% !important;
+        margin-left: 0px;
+    }
+    #appointment_box #main-area > table > tbody > tr > td:nth-of-type(1) {
+        width: 100% !important;
+    }
+}
+
+@media screen and (max-width: 600px) {
+    #appointment.classic label {
+        width: auto !important;
+    }
+    #appointment.classic {
+        padding: 20px 20px 300px;
+    }
+    #appointment > table:not(#groupTable) tbody > tr > td {
+        width: auto !important;
+    }
+    #appointment > table:not(#groupTable) tbody > tr {
+        display: block;
+    }
+    #appointment > table:not(#groupTable) tbody {
+        display: block;
+    }
+    #appointment > div:not([class]) table tbody {
+        width: 100%;
+        display: flex;
+    }
+    #appointment > div:not([class]) table tr {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+    }
+    #appointment > div:not([class]) table tr td {
+        padding-top: 0px;
+        padding-right: 0px;
+        padding-bottom: 0px;
+        width: 100% !important;
+        padding-left: 0px !important;
+    }
+    #appointment > div:not([class]) table .form-button-wrapper .btn {
+        width: 100%;
+        margin: 0px;
+    }
+    #btn-search {
+        height: 40px;
+    }
+}
+
+@media (max-width: 520px) {
+    .box.dropdown ul li:hover span.flag-icon,
+    .box.dropdown ul li.active span.flag-icon,
+    .box.dropdown ul li span.flag-icon {
+        right: 30px;
+    }
+    input[type="checkbox"].form-control {
+        width: 20px !important;
+        height: 20px;
+    }
+    .btn.warning {
+        width: 100%;
+        background-color: rgb(77, 150, 72);
+    }
+    #header-wrapper #mini-menu-wrapper .box-field.box-buttons .btn {
+        font-size: 13px;
+    }
+    form.classic.one-field .form-item {
+        display: block;
+        width: 100%;
+        margin: 0px;
+    }
+    form.classic.one-field .form-button-wrapper {
+        display: block;
+        margin-left: 0px;
+    }
+    #groupTable,
+    #appointment table {
+        & ::-webkit-scrollbar {
+            height: 5px;
+        }
+    }
+    #vac.classic #vac-holidays-wrapper .table {
+        display: block;
+    }
+    #vac.classic #vac-holidays-wrapper .table .form-item {
+        display: block;
+        margin-bottom: 15px;
+    }
+}
+
+@media screen and (max-width: 450px) {
+    #appointment_box #main-area > table > tbody > tr > td {
+        width: 320px !important;
+    }
+    #appointment_box #main-area > table > tbody > tr > td:nth-of-type(2) {
+        width: 320px !important;
+    }
+    #appointment.classic {
+        padding: 20px 10px 300px;
+    }
+}
+
+@media only screen and (max-device-width: 1300px) {
+    .form-control,
+    .select2,
+    .select2-container {
+        font-size: 16px !important;
+    }
+}
