@@ -26,7 +26,7 @@ APPOINTMENT_TYPES = [
     ("26", "Long-Term Type D (Seasonal/Dependent Employment)"),
 ]
 
-DAYS_TO_SCAN = 7
+DAYS_TO_SCAN = 4
 
 
 # ============================================================================
@@ -270,8 +270,8 @@ async def scan_dates_for_type(page: Page, type_value: str, type_label: str) -> b
         await search_btn.click()
         await human_mouse_move(page)
 
-        debug("Waiting 30-40 seconds for search results and security verification...")
-        await asyncio.sleep(35)
+        debug("Waiting 10 seconds for search results...")
+        await asyncio.sleep(10)
 
         # Check if a validation modal popped up
         try:
@@ -380,9 +380,6 @@ async def main():
 
             debug(f"Navigating to Visa Portal: {TARGET_URL}")
             await page.goto(TARGET_URL, timeout=60000, wait_until="domcontentloaded")
-
-            debug("Pausing 35 seconds to allow page loading & Cloudflare / security CAPTCHA verification...")
-            await asyncio.sleep(35)
 
             debug("Page loaded. Looking around before interacting...")
             await human_mouse_move(page)
