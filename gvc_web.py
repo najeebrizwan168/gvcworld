@@ -29,11 +29,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import re
+import socket
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -47,11 +50,113 @@ from pydantic import BaseModel, Field
 import gvcAutomation as bot
 import win_hide
 
-BASE_DIR = Path(__file__).resolve().parent
-WEB_DIR = BASE_DIR / "web"
-CONFIG_FILE = BASE_DIR / "gvc_ui_config.json"
+# Running as a plain script vs. a PyInstaller-built exe changes where things
+# live. Bundled read-only assets (web/index.html) are unpacked by PyInstaller
+# into a temp dir (sys._MEIPASS) that's recreated on every launch — fine for
+# static files, useless for anything that needs to persist between runs.
+# Writable/persistent data (saved form settings, the log file when there's no
+# console to see errors on) instead goes next to the actual exe.
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    WEB_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / "web"
+    PERSIST_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+    WEB_DIR = BASE_DIR / "web"
+    PERSIST_DIR = BASE_DIR
+
+CONFIG_FILE = PERSIST_DIR / "gvc_ui_config.json"
+LOG_FILE = PERSIST_DIR / "gvc_app.log"
 
 MAX_LOG_LINES = 3000
+
+# Hosts used only to test general internet reachability (DNS port, not HTTP)
+# — cheap, no dependency, doesn't care whether the GVC portal itself happens
+# to be down.
+CONNECTIVITY_PROBES = [("8.8.8.8", 53), ("1.1.1.1", 53)]
+
+
+def has_internet(timeout: float = 3.0) -> bool:
+    for host, port in CONNECTIVITY_PROBES:
+        try:
+            socket.create_connection((host, port), timeout=timeout).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def show_message_box(text: str, title: str, is_error: bool = False) -> None:
+    """Native Windows message box — the only way to reach the user when the
+    app is built with --windowed (no console) and hasn't opened a browser
+    tab yet, e.g. the no-internet case."""
+    MB_ICONERROR = 0x10
+    MB_ICONINFORMATION = 0x40
+    icon = MB_ICONERROR if is_error else MB_ICONINFORMATION
+    ctypes.windll.user32.MessageBoxW(0, text, title, icon)
+
+
+class _NullWriter:
+    """Absorbs writes silently — used when even the fallback destination is
+    unusable, so print()/traceback calls never crash with 'write to closed/
+    missing stream' instead of just losing that one line."""
+
+    def write(self, *_a: Any, **_k: Any) -> int:
+        return 0
+
+    def flush(self) -> None:
+        pass
+
+
+class _Tee:
+    """Writes to two streams. In a --windowed build, sys.stdout is not
+    reliably None (observed: PyInstaller 6.21 attaches a working
+    TextIOWrapper that writes nowhere visible) so there's no clean signal to
+    detect 'no console is attached' at runtime. Rather than rely on that,
+    always duplicate output into a persistent log file next to the exe *in
+    addition to* whatever sys.stdout/stderr already are — harmless no-op
+    destination in windowed mode, still-visible console in console mode,
+    correct either way."""
+
+    def __init__(self, *streams: Any) -> None:
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data: str) -> int:
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        # Never a real interactive terminal — keeps libraries that probe this
+        # (e.g. uvicorn deciding whether to emit ANSI colour codes) from
+        # crashing on a plain file-like object that doesn't define it.
+        return False
+
+
+def setup_logging_for_frozen_build() -> None:
+    """Tees stdout/stderr into a log file next to the exe when running as a
+    PyInstaller build, so a client can send that file if something breaks —
+    including before the browser tab even opens, when there's nowhere else
+    for them to see it."""
+    if not FROZEN:
+        return
+    try:
+        log = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        log = _NullWriter()
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
+    print(f"\n{'=' * 60}\n[{datetime.now().isoformat(timespec='seconds')}] App started")
 
 # Snapshot the appointment types the script ships with — the UI offers these as
 # checkboxes so the user can pick which ones to cycle through.
@@ -597,23 +702,37 @@ def stop() -> JSONResponse:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local web UI for the GVC appointment scanner.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the UI.")
-    args = parser.parse_args()
+    setup_logging_for_frozen_build()
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-    url = f"http://{args.host}:{args.port}"
+    parser = argparse.ArgumentParser(description="Local web UI for the GVC appointment scanner.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the UI.")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  GVC APPOINTMENT SCANNER — LOCAL WEB UI")
+    print("  Checking internet connection...")
+    if not has_internet():
+        print("  No internet connection detected. Aborting startup.")
+        show_message_box(
+            "This app needs an internet connection to run — it downloads the "
+            "Chrome driver and talks to the visa portal.\n\n"
+            "Please connect to the internet and start the app again.",
+            "No Internet Connection",
+            is_error=True,
+        )
+        return
+    print("  Internet OK.")
+
+    url = f"http://{args.host}:{args.port}"
     print(f"  Open: {url}")
-    print("  The Chrome window for the CAPTCHA opens separately when you")
-    print("  press Start. Keep this terminal open while it runs.")
+    print("  The Chrome window for the CAPTCHA opens separately when you press Start.")
     print("=" * 60)
 
     if not args.no_browser:
@@ -623,4 +742,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # main()'s first line already installs the log-file tee, so this
+        # only matters if something failed before that line ran.
+        setup_logging_for_frozen_build()
+        traceback.print_exc()
+        if FROZEN:
+            show_message_box(
+                f"The app hit an unexpected error and has to close.\n\n"
+                f"Details were written to:\n{LOG_FILE}",
+                "GVC Appointment Scanner — Error",
+                is_error=True,
+            )
+        raise

@@ -3,3 +3,8 @@ __pycache__/
 
 # Saved UI form values — contains personal applicant details
 gvc_ui_config.json
+
+# PyInstaller build output — rebuild from source, don't version the binary
+build_dist/release/
+build_dist/work_release/
+gvc_app.log
