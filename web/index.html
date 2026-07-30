@@ -199,7 +199,9 @@
 
     <div class="note">
       Pressing <b>Start</b> opens a separate Chrome window. Solve the CAPTCHA and
-      sign in there, then come back and click <b>Continue</b>.
+      sign in there, then come back and click <b>Continue</b> — the window then
+      hides completely (not even in the taskbar) while it scans in the
+      background. It reappears automatically when it needs you again.
     </div>
 
     <form id="form" autocomplete="off">
@@ -282,6 +284,7 @@
       <div class="stat"><div class="k">State</div><div class="v" id="sState">Idle</div></div>
       <div class="stat"><div class="k">Running for</div><div class="v" id="sUptime">—</div></div>
       <div class="stat"><div class="k">Slot hits</div><div class="v" id="sHits">0</div></div>
+      <div class="stat"><div class="k">Chrome window</div><div class="v" id="sWindow">—</div></div>
     </div>
 
     <div class="console-head">
@@ -371,6 +374,7 @@ async function poll() {
   $("sUptime").textContent = live ? fmtUptime(s.uptime) : "—";
   $("sHits").textContent = s.slot_hits;
   $("sHits").className = "v" + (s.slot_hits > 0 ? " hit" : "");
+  $("sWindow").textContent = !live ? "—" : s.window_hidden ? "Hidden (running)" : "Visible";
 
   const dot = $("dot");
   dot.className = "dot" + (waiting ? " wait" : live ? " live" : s.state === "error" ? " err" : "");

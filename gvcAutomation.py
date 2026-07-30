@@ -567,8 +567,8 @@ def launch_browser_and_login():
         debug("Sidebar click failed. Navigating directly to appointment URL...")
         driver.get(APPOINTMENT_URL)
 
-    debug("Waiting for appointment form to load...")
-    wait.until(
+    debug("Waiting for appointment form to load (up to 120s)...")
+    WebDriverWait(driver, 120).until(
         EC.visibility_of_element_located((By.CSS_SELECTOR, "#appointment"))
     )
     debug("Appointment form (#appointment) is visible and ready!")
@@ -651,7 +651,7 @@ def main():
                     driver.get(APPOINTMENT_URL)
                     random_pause(3.0, 5.0)
                     try:
-                        WebDriverWait(driver, 20).until(
+                        WebDriverWait(driver, 120).until(
                             EC.visibility_of_element_located((By.CSS_SELECTOR, "#appointment"))
                         )
                         fill_applicant_fields(driver)

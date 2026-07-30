@@ -10,9 +10,15 @@ The automation script itself is NOT modified. Instead this module:
   * shadows `print` inside that module so every log line is captured,
   * shadows `input` inside that module so the two manual gates
     ("solve the CAPTCHA + sign in", "slots found, press ENTER to resume")
-    become buttons in the web UI instead of terminal prompts.
+    become buttons in the web UI instead of terminal prompts,
+  * shadows `webdriver` with a thin proxy that captures the Chrome instance
+    the moment it's created, so its window can be located and controlled.
 
 The CAPTCHA is still solved by hand in the Chrome window that Selenium opens.
+Once you confirm login, the window is fully hidden (win_hide.py, Win32
+ShowWindow — not just minimized, not in the taskbar) while scanning runs in
+the background. It's restored automatically whenever the script needs you
+again (slots found -> OTP/booking), then hidden again once you continue.
 
 Usage:
     python gvc_web.py                 # http://127.0.0.1:8000
@@ -39,6 +45,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import gvcAutomation as bot
+import win_hide
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -139,6 +146,8 @@ class Runner:
         self._slot_hits = 0
         self._started_at: float | None = None
         self._driver: Any = None
+        self._hwnd: int | None = None
+        self._window_hidden = False
 
     # ---- logging -------------------------------------------------------
     def log(self, text: str, level: str | None = None) -> None:
@@ -176,6 +185,7 @@ class Runner:
                 "gate_prompt": self._gate_prompt,
                 "slot_hits": self._slot_hits,
                 "uptime": (time.time() - self._started_at) if self._started_at else 0,
+                "window_hidden": self._window_hidden,
                 "seq": self._seq,
                 "lines": lines,
             }
@@ -191,6 +201,8 @@ class Runner:
             self._state = "starting"
             self._detail = ""
             self._started_at = time.time()
+            self._hwnd = None
+            self._window_hidden = False
 
         self._stop.clear()
         self._continue.clear()
@@ -218,13 +230,30 @@ class Runner:
 
     # ---- browser bookkeeping -------------------------------------------
     def _track_driver(self, driver: Any) -> None:
+        """Called the instant Chrome is created. Runs on the scanner thread —
+        blocking here briefly to locate the window handle is fine."""
         with self._lock:
             self._driver = driver
+            self._hwnd = None
+            self._window_hidden = False
+
+        try:
+            driver_pid = driver.service.process.pid
+        except Exception:
+            return  # window hide/show simply won't be available this run
+
+        hwnd = win_hide.find_chrome_hwnd(driver_pid, timeout=10.0)
+        with self._lock:
+            self._hwnd = hwnd
+        if hwnd is None:
+            self.log("Could not locate the Chrome window handle — hide/show will be unavailable.", level="warn")
 
     def _close_driver(self) -> None:
         """Belt-and-braces cleanup — safe to call even if main() already quit."""
         with self._lock:
             driver, self._driver = self._driver, None
+            self._hwnd = None
+            self._window_hidden = False
         if driver is None:
             return
         try:
@@ -232,6 +261,32 @@ class Runner:
             self.log("Chrome window closed.", level="warn")
         except Exception:
             pass  # already gone
+
+    def _hide_window(self) -> None:
+        with self._lock:
+            hwnd = self._hwnd
+        if hwnd is None:
+            return
+        try:
+            win_hide.hide_window(hwnd)
+            with self._lock:
+                self._window_hidden = True
+            self.log("Chrome window hidden — running in the background.", level="head")
+        except Exception as exc:
+            self.log(f"Could not hide the Chrome window: {exc}", level="warn")
+
+    def _show_window(self) -> None:
+        with self._lock:
+            hwnd = self._hwnd
+        if hwnd is None:
+            return
+        try:
+            win_hide.show_window(hwnd)
+            with self._lock:
+                self._window_hidden = False
+            self.log("Chrome window restored to the foreground.", level="head")
+        except Exception as exc:
+            self.log(f"Could not restore the Chrome window: {exc}", level="warn")
 
     # ---- injected into gvcAutomation -----------------------------------
     def _make_print(self):
@@ -261,15 +316,26 @@ class Runner:
 
         def patched(prompt: str = "") -> str:
             text = str(prompt).strip()
-            is_login = "login" in text.lower() or not text
+            # gvcAutomation.py has exactly two input() call sites: the login
+            # gate passes a prompt string, the post-slots-found resume gate
+            # calls input() with no argument at all — that's the only
+            # reliable way to tell them apart.
+            is_login = bool(text)
             state = "awaiting_login" if is_login else "awaiting_resume"
-            message = text or "Solve the CAPTCHA and sign in, then click Continue."
+            message = text or "Slots found! Finish the booking in the Chrome window, then click Continue."
 
             with self._lock:
                 self._gate_prompt = message
                 self._state = state
                 self._detail = message
-            self.log(f"[GATE] Waiting for you: {message}", level="gate")
+
+            if is_login:
+                self.log(f"[GATE] Waiting for you: {message}", level="gate")
+            else:
+                # The window was hidden while scanning — bring it back so the
+                # user can enter the OTP and complete the booking.
+                self.log("[GATE] Slots found — restoring the Chrome window for you.", level="gate")
+                self._show_window()
 
             while True:
                 if self._stop.is_set():
@@ -286,6 +352,11 @@ class Runner:
                 self._state = "running"
                 self._detail = ""
             self.log("[GATE] Continue received — resuming automation.", level="gate")
+
+            # Login gate resolved: the CAPTCHA/sign-in is done, so hide the
+            # window and let scanning run in the background. Resume gate
+            # resolved: booking is done, hide it again until next hit.
+            self._hide_window()
             return ""
 
         return patched
