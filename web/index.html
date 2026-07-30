@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GVC Appointment Scanner</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --border: #2a3240;
+    --text: #e6edf3;
+    --muted: #8b97a6;
+    --accent: #4f8cff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --error: #f85149;
+    --gate: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 22px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .badge {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 12px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    font-size: 12px; font-weight: 600;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--good); animation: pulse 1.4s infinite; }
+  .dot.wait { background: var(--gate); animation: pulse 1s infinite; }
+  .dot.err  { background: var(--error); }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+
+  main {
+    display: grid;
+    grid-template-columns: 400px 1fr;
+    gap: 18px;
+    padding: 18px 22px 28px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .card h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--muted); margin: 0 0 14px;
+  }
+  fieldset { border: 0; padding: 0; margin: 0 0 18px; }
+  fieldset legend {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .7px;
+    color: var(--accent); font-weight: 700; padding: 0 0 8px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  input[type=text], input[type=password], input[type=date], input[type=number], select {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field { margin-bottom: 12px; }
+
+  .types { display: flex; flex-direction: column; gap: 8px; }
+  .types label {
+    display: flex; gap: 9px; align-items: flex-start;
+    color: var(--text); font-size: 12.5px; margin: 0;
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 9px 11px; border-radius: 7px; cursor: pointer;
+  }
+  .types label:hover { border-color: var(--accent); }
+  .types input { margin-top: 2px; accent-color: var(--accent); }
+
+  .actions { display: flex; gap: 10px; margin-top: 4px; }
+  button {
+    flex: 1;
+    padding: 11px 14px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    font: inherit; font-weight: 600;
+    cursor: pointer;
+    transition: filter .12s;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.12); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-start { background: var(--accent); color: #fff; }
+  .btn-stop  { background: transparent; color: var(--error); border-color: var(--error); }
+  .btn-go    { background: var(--good); color: #06210c; }
+
+  .check { display: flex; align-items: center; gap: 8px; margin: 12px 0 16px; }
+  .check label { margin: 0; color: var(--text); font-size: 12.5px; }
+
+  .gate {
+    display: none;
+    background: linear-gradient(90deg, rgba(163,113,247,.16), rgba(163,113,247,.04));
+    border: 1px solid var(--gate);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  .gate.show { display: block; }
+  .gate h3 { margin: 0 0 8px; font-size: 14px; color: var(--gate); }
+  .gate p { margin: 0 0 12px; font-size: 13px; color: var(--text); }
+  .gate ol { margin: 0 0 14px 18px; padding: 0; font-size: 13px; color: var(--muted); }
+  .gate ol li { margin-bottom: 4px; }
+
+  .err {
+    display: none;
+    background: rgba(248,81,73,.1);
+    border: 1px solid var(--error);
+    color: #ffb4b0;
+    border-radius: 7px; padding: 10px 12px; margin-bottom: 14px; font-size: 12.5px;
+  }
+  .err.show { display: block; }
+
+  .note {
+    font-size: 12px; color: var(--muted);
+    background: var(--panel-2); border-left: 2px solid var(--accent);
+    padding: 9px 12px; border-radius: 0 6px 6px 0; margin-bottom: 16px;
+  }
+
+  .stats { display: flex; gap: 10px; margin-bottom: 14px; }
+  .stat {
+    flex: 1; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  .stat .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+  .stat .v { font-size: 17px; font-weight: 700; margin-top: 2px; }
+  .stat .v.hit { color: var(--good); }
+
+  .console-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .console-head h2 { margin: 0; }
+  .console-head .spacer { margin-left: auto; }
+  .console-head label { margin: 0; display: flex; align-items: center; gap: 6px; }
+
+  #log {
+    height: calc(100vh - 300px);
+    min-height: 340px;
+    overflow-y: auto;
+    background: #0a0d12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font: 12.5px/1.65 "Cascadia Mono", Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #log .l { display: flex; gap: 10px; }
+  #log .ts { color: #55606f; flex: 0 0 auto; }
+  #log .tx { flex: 1 1 auto; }
+  .lv-info  .tx { color: #c9d4e0; }
+  .lv-head  .tx { color: var(--accent); font-weight: 600; }
+  .lv-good  .tx { color: var(--good); font-weight: 600; }
+  .lv-warn  .tx { color: var(--warn); }
+  .lv-error .tx { color: var(--error); font-weight: 600; }
+  .lv-gate  .tx { color: var(--gate); font-weight: 600; }
+  #log .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GVC Appointment Scanner</h1>
+  <span class="sub" id="target"></span>
+  <span class="badge"><span class="dot" id="dot"></span><span id="stateLabel">Idle</span></span>
+</header>
+
+<main>
+  <!-- ------------------------------------------------ left: form -->
+  <section class="card">
+    <h2>Run configuration</h2>
+
+    <div class="err" id="formError"></div>
+
+    <div class="note">
+      Pressing <b>Start</b> opens a separate Chrome window. Solve the CAPTCHA and
+      sign in there, then come back and click <b>Continue</b>.
+    </div>
+
+    <form id="form" autocomplete="off">
+      <fieldset>
+        <legend>Portal login</legend>
+        <div class="field">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password">
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Applicant details</legend>
+        <div class="row">
+          <div class="field">
+            <label for="dob">Date of birth</label>
+            <input type="date" id="dob" name="dob">
+          </div>
+          <div class="field">
+            <label for="passport_expiry">Passport expiry</label>
+            <input type="date" id="passport_expiry" name="passport_expiry">
+          </div>
+        </div>
+        <div class="field">
+          <label for="passport_number">Passport number</label>
+          <input type="text" id="passport_number" name="passport_number" spellcheck="false">
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="gender">Gender</label>
+            <select id="gender" name="gender"></select>
+          </div>
+          <div class="field">
+            <label for="nationality">Nationality</label>
+            <input type="text" id="nationality" name="nationality" spellcheck="false">
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Scan settings</legend>
+        <div class="field">
+          <label for="days_to_scan">Days to scan per appointment type</label>
+          <input type="number" id="days_to_scan" name="days_to_scan" min="1" max="30">
+        </div>
+        <label style="margin-bottom:8px">Appointment types to cycle through</label>
+        <div class="types" id="types"></div>
+      </fieldset>
+
+      <div class="check">
+        <input type="checkbox" id="remember" checked>
+        <label for="remember">Remember these details (password is never saved)</label>
+      </div>
+
+      <div class="actions">
+        <button type="submit" class="btn-start" id="btnStart">Start scanning</button>
+        <button type="button" class="btn-stop" id="btnStop" disabled>Stop</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ------------------------------------------------ right: console -->
+  <section class="card">
+    <div class="gate" id="gate">
+      <h3 id="gateTitle">Action needed in the Chrome window</h3>
+      <p id="gateMsg"></p>
+      <ol id="gateSteps">
+        <li>Switch to the Chrome window the scanner opened.</li>
+        <li>Solve the reCAPTCHA (image puzzle if it appears).</li>
+        <li>Click <b>Sign In</b> and wait for the dashboard to load.</li>
+      </ol>
+      <button type="button" class="btn-go" id="btnGo" style="max-width:280px">I'm signed in — Continue</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">State</div><div class="v" id="sState">Idle</div></div>
+      <div class="stat"><div class="k">Running for</div><div class="v" id="sUptime">—</div></div>
+      <div class="stat"><div class="k">Slot hits</div><div class="v" id="sHits">0</div></div>
+    </div>
+
+    <div class="console-head">
+      <h2>Live output</h2>
+      <span class="spacer"></span>
+      <label><input type="checkbox" id="autoscroll" checked> Auto-scroll</label>
+    </div>
+    <div id="log"><div class="empty">Waiting to start…</div></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const STATE_TEXT = {
+  idle: "Idle", starting: "Starting…", running: "Scanning",
+  awaiting_login: "Waiting for you", awaiting_resume: "Waiting for you",
+  stopping: "Stopping…", stopped: "Stopped", error: "Error",
+};
+const LIVE = new Set(["starting", "running", "awaiting_login", "awaiting_resume", "stopping"]);
+
+let lastSeq = 0;
+let logEmpty = true;
+let typeChoices = [];
+
+// ---------------------------------------------------------------- bootstrap
+async function boot() {
+  const r = await fetch("/api/bootstrap");
+  const b = await r.json();
+
+  $("target").textContent = b.target_url;
+  typeChoices = b.appointment_types;
+
+  $("gender").innerHTML = b.genders
+    .map((g) => `<option value="${g.value}">${g.label}</option>`)
+    .join("");
+
+  $("types").innerHTML = typeChoices
+    .map((t) => `<label><input type="checkbox" class="type-cb" value="${t.value}">
+                 <span>${t.label}</span></label>`)
+    .join("");
+
+  // saved settings (no password) win over the script's hardcoded defaults
+  const d = b.defaults, s = b.saved || {};
+  $("username").value = s.username ?? d.username ?? "";
+  $("passport_number").value = s.passport_number ?? d.passport_number ?? "";
+  $("nationality").value = s.nationality ?? d.nationality ?? "PAKISTAN";
+  $("gender").value = s.gender ?? d.gender ?? "2";
+  $("days_to_scan").value = s.days_to_scan ?? d.days_to_scan ?? 4;
+  $("dob").value = toISO(s.dob ?? d.dob);
+  $("passport_expiry").value = toISO(s.passport_expiry ?? d.passport_expiry);
+
+  const chosen = new Set(s.appointment_types ?? d.appointment_types ?? []);
+  document.querySelectorAll(".type-cb").forEach((cb) => { cb.checked = chosen.has(cb.value); });
+
+  poll();
+  setInterval(poll, 1000);
+}
+
+// dd/mm/yyyy (or yyyy-mm-dd) -> yyyy-mm-dd for <input type=date>
+function toISO(v) {
+  if (!v) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(v.trim());
+  if (!m) return "";
+  return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------- polling
+async function poll() {
+  let s;
+  try {
+    const r = await fetch(`/api/status?since=${lastSeq}`);
+    s = await r.json();
+  } catch {
+    return; // server restarting — try again next tick
+  }
+
+  if (s.seq < lastSeq) { $("log").innerHTML = ""; logEmpty = true; lastSeq = 0; }
+  if (s.lines.length) appendLines(s.lines);
+
+  const live = LIVE.has(s.state);
+  const waiting = s.state === "awaiting_login" || s.state === "awaiting_resume";
+
+  $("stateLabel").textContent = STATE_TEXT[s.state] || s.state;
+  $("sState").textContent = STATE_TEXT[s.state] || s.state;
+  $("sUptime").textContent = live ? fmtUptime(s.uptime) : "—";
+  $("sHits").textContent = s.slot_hits;
+  $("sHits").className = "v" + (s.slot_hits > 0 ? " hit" : "");
+
+  const dot = $("dot");
+  dot.className = "dot" + (waiting ? " wait" : live ? " live" : s.state === "error" ? " err" : "");
+
+  $("btnStart").disabled = live;
+  $("btnStop").disabled = !live;
+  setFormDisabled(live);
+
+  if (waiting) {
+    $("gate").classList.add("show");
+    $("gateMsg").textContent = s.gate_prompt || "";
+    const resume = s.state === "awaiting_resume";
+    $("gateTitle").textContent = resume
+      ? "Slots found — finish the booking in Chrome"
+      : "Action needed in the Chrome window";
+    $("gateSteps").style.display = resume ? "none" : "";
+    $("btnGo").textContent = resume ? "Done — resume scanning" : "I'm signed in — Continue";
+  } else {
+    $("gate").classList.remove("show");
+  }
+}
+
+function appendLines(lines) {
+  const log = $("log");
+  if (logEmpty) { log.innerHTML = ""; logEmpty = false; }
+  const frag = document.createDocumentFragment();
+  for (const l of lines) {
+    const row = document.createElement("div");
+    row.className = `l lv-${l.level}`;
+    const ts = document.createElement("span");
+    ts.className = "ts"; ts.textContent = l.t;
+    const tx = document.createElement("span");
+    tx.className = "tx"; tx.textContent = l.text;
+    row.append(ts, tx);
+    frag.append(row);
+    lastSeq = Math.max(lastSeq, l.i);
+  }
+  log.append(frag);
+  while (log.childElementCount > 3000) log.removeChild(log.firstChild);
+  if ($("autoscroll").checked) log.scrollTop = log.scrollHeight;
+}
+
+function fmtUptime(sec) {
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function setFormDisabled(disabled) {
+  $("form").querySelectorAll("input, select").forEach((el) => {
+    if (el.id === "autoscroll") return;
+    el.disabled = disabled;
+  });
+}
+
+function showError(msg) {
+  const box = $("formError");
+  box.textContent = msg;
+  box.classList.toggle("show", !!msg);
+}
+
+// ---------------------------------------------------------------- actions
+$("form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  showError("");
+
+  const payload = {
+    username: $("username").value,
+    password: $("password").value,
+    dob: $("dob").value,
+    passport_number: $("passport_number").value,
+    passport_expiry: $("passport_expiry").value,
+    gender: $("gender").value,
+    nationality: $("nationality").value,
+    days_to_scan: Number($("days_to_scan").value || 4),
+    appointment_types: [...document.querySelectorAll(".type-cb:checked")].map((cb) => cb.value),
+    remember: $("remember").checked,
+  };
+
+  $("btnStart").disabled = true;
+  try {
+    const r = await fetch("/api/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!data.ok) { showError(data.error || "Could not start the scanner."); $("btnStart").disabled = false; return; }
+    lastSeq = 0;
+    $("log").innerHTML = ""; logEmpty = true;
+  } catch (e) {
+    showError("Could not reach the local server: " + e.message);
+    $("btnStart").disabled = false;
+  }
+  poll();
+});
+
+$("btnGo").addEventListener("click", async () => {
+  $("btnGo").disabled = true;
+  try { await fetch("/api/continue", { method: "POST" }); } catch {}
+  setTimeout(() => { $("btnGo").disabled = false; poll(); }, 400);
+});
+
+$("btnStop").addEventListener("click", async () => {
+  $("btnStop").disabled = true;
+  try { await fetch("/api/stop", { method: "POST" }); } catch {}
+  poll();
+});
+
+boot();
+</script>
+</body>
+</html>

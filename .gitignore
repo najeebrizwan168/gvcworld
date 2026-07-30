@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Saved UI form values — contains personal applicant details
+gvc_ui_config.json
