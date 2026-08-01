@@ -4,6 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import json
+import calendar
 from pathlib import Path
 import traceback
 from datetime import datetime, timedelta
@@ -80,6 +81,95 @@ def normalize_date(raw: str, field: str) -> str:
     raise ValueError(f"{field} must look like dd/mm/yyyy - got {value!r}")
 
 
+class CalendarPopup(tk.Toplevel):
+    """
+    A month-grid date picker for the scan range fields.
+
+    Deliberately pure tkinter rather than tkcalendar: the app ships as a frozen
+    PyInstaller bundle, and this avoids adding a third-party dependency that
+    would have to be collected into it.
+    """
+
+    DAY_HEADS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+
+    def __init__(self, parent, date_var):
+        super().__init__(parent)
+        self.date_var = date_var
+        self.title("Pick a date")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        try:
+            selected = datetime.strptime(normalize_date(date_var.get(), "date"), "%d/%m/%Y")
+        except Exception:
+            selected = datetime.now()
+        self.year, self.month = selected.year, selected.month
+        self.selected = selected
+
+        header = ttk.Frame(self, padding=(6, 6, 6, 0))
+        header.pack(fill=tk.X)
+        ttk.Button(header, text="‹", width=3,
+                   command=lambda: self.shift_month(-1)).pack(side=tk.LEFT)
+        self.header_label = ttk.Label(header, anchor="center",
+                                      font=("Arial", 10, "bold"), width=18)
+        self.header_label.pack(side=tk.LEFT, expand=True)
+        ttk.Button(header, text="›", width=3,
+                   command=lambda: self.shift_month(1)).pack(side=tk.LEFT)
+
+        self.grid_frame = ttk.Frame(self, padding=6)
+        self.grid_frame.pack()
+
+        footer = ttk.Frame(self, padding=(6, 0, 6, 6))
+        footer.pack(fill=tk.X)
+        ttk.Button(footer, text="Today", command=self.pick_today).pack(side=tk.LEFT)
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+
+        self.draw()
+        self.update_idletasks()
+        self.geometry(f"+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 120}")
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def shift_month(self, delta):
+        month = self.month + delta
+        year = self.year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        self.year, self.month = year, month
+        self.draw()
+
+    def pick_today(self):
+        self.choose(datetime.now())
+
+    def choose(self, when: datetime):
+        self.date_var.set(when.strftime("%d/%m/%Y"))
+        self.destroy()
+
+    def draw(self):
+        for widget in self.grid_frame.winfo_children():
+            widget.destroy()
+
+        self.header_label.config(text=f"{calendar.month_name[self.month]} {self.year}")
+        for col, name in enumerate(self.DAY_HEADS):
+            ttk.Label(self.grid_frame, text=name, width=4, anchor="center",
+                      font=("Arial", 8, "bold")).grid(row=0, column=col, padx=1, pady=(0, 2))
+
+        today = datetime.now().date()
+        for r, week in enumerate(calendar.Calendar(firstweekday=0).monthdayscalendar(
+                self.year, self.month), start=1):
+            for c, day in enumerate(week):
+                if day == 0:
+                    continue
+                when = datetime(self.year, self.month, day)
+                style = "TButton"
+                if when.date() == today:
+                    style = "Today.TButton"
+                if when.date() == self.selected.date():
+                    style = "Selected.TButton"
+                ttk.Button(self.grid_frame, text=str(day), width=4, style=style,
+                           command=lambda w=when: self.choose(w)).grid(
+                    row=r, column=c, padx=1, pady=1)
+
+
 class WebDriverProxy:
     def __init__(self, real_module, on_create):
         self._real = real_module
@@ -108,6 +198,11 @@ class App(tk.Tk):
         self._hwnd = None
         self._lock = threading.Lock()
         
+        style = ttk.Style(self)
+        style.configure("Today.TButton", foreground="#0a58ca", font=("Arial", 9, "bold"))
+        style.configure("Selected.TButton", foreground="#ffffff", background="#0a58ca")
+        style.map("Selected.TButton", background=[("active", "#0a58ca")])
+
         self.build_ui()
         self.load_settings()
 
@@ -187,9 +282,16 @@ class App(tk.Tk):
         ttk.Label(left_frame, text="Scan End Date:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
         row += 1
         self.start_date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
-        ttk.Entry(left_frame, textvariable=self.start_date_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
+        self._date_field(left_frame, row, 0, self.start_date_var)
         self.end_date_var = tk.StringVar(value=(datetime.now() + timedelta(days=4)).strftime("%d/%m/%Y"))
-        ttk.Entry(left_frame, textvariable=self.end_date_var, width=22).grid(row=row, column=1, pady=2, padx=2, sticky="w")
+        self._date_field(left_frame, row, 1, self.end_date_var)
+        row += 1
+
+        self.range_label = ttk.Label(left_frame, text="", foreground="gray", font=("Arial", 8))
+        self.range_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=2)
+        self.start_date_var.trace_add("write", self.update_range_label)
+        self.end_date_var.trace_add("write", self.update_range_label)
+        self.update_range_label()
         row += 1
         
         # Appointment Types (span across)
@@ -229,6 +331,32 @@ class App(tk.Tk):
         ttk.Label(right_frame, text="Console Output", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
         self.log_area = scrolledtext.ScrolledText(right_frame, wrap=tk.WORD, state="disabled", font=("Consolas", 10), bg="#1e1e1e", fg="#cccccc")
         self.log_area.pack(fill=tk.BOTH, expand=True)
+
+    def _date_field(self, parent, row, column, var):
+        """A date entry paired with a button that opens the calendar picker."""
+        holder = ttk.Frame(parent)
+        holder.grid(row=row, column=column, pady=2, padx=2, sticky="w")
+        ttk.Entry(holder, textvariable=var, width=16).pack(side=tk.LEFT)
+        ttk.Button(holder, text="📅", width=3,
+                   command=lambda: CalendarPopup(self, var)).pack(side=tk.LEFT, padx=(2, 0))
+
+    def update_range_label(self, *args):
+        """Shows how many days the chosen range covers, so an over-long scan is
+        obvious before it starts rather than after."""
+        try:
+            start = datetime.strptime(normalize_date(self.start_date_var.get(), "start"), "%d/%m/%Y")
+            end = datetime.strptime(normalize_date(self.end_date_var.get(), "end"), "%d/%m/%Y")
+        except Exception:
+            self.range_label.config(text="", foreground="gray")
+            return
+
+        days = (end - start).days + 1
+        if days < 1:
+            self.range_label.config(text="End date is before start date", foreground="red")
+        else:
+            self.range_label.config(
+                text=f"{days} day{'s' if days != 1 else ''} per appointment type",
+                foreground="gray" if days <= 30 else "#b06000")
 
     def update_appointment_types_ui(self, *args):
         for widget in self.types_frame.winfo_children():
@@ -279,7 +407,8 @@ class App(tk.Tk):
             self.update_appointment_types_ui()
             
             saved_types = data.get("appointment_types", [])
-            saved_values = {t["value"] for t in saved_types}
+            # Older configs stored bare value strings instead of {value,label}
+            saved_values = {t["value"] if isinstance(t, dict) else str(t) for t in saved_types}
             if saved_values:
                 for t in self.current_appointment_choices:
                     self.type_vars[t["value"]].set(t["value"] in saved_values)

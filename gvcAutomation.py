@@ -59,6 +59,15 @@ SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
 SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
 
 
+# How long to wait for a search to return before judging the result. The wait
+# polls and exits as soon as the result lands, so this is a ceiling, not a cost.
+SEARCH_RESULT_WAIT_SECONDS = 3
+
+# Latched off the first time this portal refuses a native click (it refuses all
+# of them), so later clicks skip straight to JS. Reset on each browser launch.
+_NATIVE_CLICK_WORKS = True
+
+
 class SessionLostError(Exception):
     """Raised when the portal has bounced us back to the login page."""
 
@@ -97,27 +106,33 @@ def safe_click(driver, target, description="element") -> bool:
     was over it).
 
     The native click is tried first because it keeps the human-like input
-    events; a JS click and then a synthetic MouseEvent sequence take over when
-    the driver refuses, since neither is subject to those checks.
+    events, but this portal rejects it on every control. Rather than pay that
+    failed round-trip on every single click, the first refusal latches
+    _NATIVE_CLICK_WORKS off and the rest of the session goes straight to JS.
+    The latch resets on each browser launch, so a fresh session re-probes once.
     """
+    global _NATIVE_CLICK_WORKS
+
     element = driver.find_element(By.CSS_SELECTOR, target) if isinstance(target, str) else target
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
     except WebDriverException as err:
         _reraise_if_dead(err)
-    random_pause(0.2, 0.5)
 
-    try:
-        element.click()
-        return True
-    except WebDriverException as err:
-        _reraise_if_dead(err)
-        debug(f"Native click on {description} failed ({type(err).__name__}) — using JS click fallback.")
+    if _NATIVE_CLICK_WORKS:
+        random_pause(0.2, 0.5)
+        try:
+            element.click()
+            return True
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+            _NATIVE_CLICK_WORKS = False
+            debug(f"Native click on {description} failed ({type(err).__name__}) — "
+                  f"switching to JS clicks for the rest of this session.")
 
     try:
         driver.execute_script("arguments[0].click();", element)
-        debug(f"JS click on {description} succeeded.")
         return True
     except WebDriverException as err:
         _reraise_if_dead(err)
@@ -235,52 +250,33 @@ def human_type(driver, element, text: str):
 
 def human_type_date(driver, selector: str, date_str: str):
     """
-    Types a date into a datepicker field like a human:
-    Click field → triple-click to select all → type date → press Escape → Tab away.
+    Sets a datepicker field's value straight through the DOM.
+
+    No native click, send_keys or ActionChains here by design: every native
+    interaction with this form's datepickers is rejected with
+    ElementNotInteractableException, so attempting one only burns a WebDriver
+    round-trip before the fallback runs anyway. We write the value, fire the
+    events jQuery UI and the app's handlers listen on, then close any calendar
+    panel that opened.
     """
     field = driver.find_element(By.CSS_SELECTOR, selector)
+    js_set_value(driver, field, date_str)
 
     try:
-        field.click()
-        random_pause(0.3, 0.6)
-
-        # Triple-click to select all text in the field
-        try:
-            ActionChains(driver).double_click(field).click(field).perform()
-        except WebDriverException:
-            field.send_keys(Keys.CONTROL + "a")
-        random_pause(0.1, 0.3)
-
-        for char in date_str:
-            field.send_keys(char)
-            time.sleep(random.uniform(0.05, 0.15))
-
-        random_pause(0.3, 0.5)
-        field.send_keys(Keys.ESCAPE)
-        random_pause(0.2, 0.4)
-        field.send_keys(Keys.TAB)
+        driver.execute_script(
+            "if (window.jQuery && jQuery.datepicker) { jQuery.datepicker._hideDatepicker(); }"
+        )
     except WebDriverException as err:
         _reraise_if_dead(err)
-        debug(f"Datepicker typing rejected ({type(err).__name__}) — writing {selector} via DOM instead.")
-        js_set_value(driver, field, date_str)
-        # Close any datepicker panel the JS write may have left open
-        try:
-            driver.execute_script(
-                "if (window.jQuery && jQuery.datepicker) { jQuery.datepicker._hideDatepicker(); }"
-            )
-        except WebDriverException:
-            pass
 
-    # Verify the field actually holds the date we asked for
-    try:
+    # Confirm it landed — searching on the wrong date is worse than not searching
+    actual = driver.execute_script("return arguments[0].value;", field)
+    if (actual or "").strip() != date_str:
+        # One retry with a plain write, in case a change handler reformatted it
+        driver.execute_script("arguments[0].value = arguments[1];", field, date_str)
         actual = driver.execute_script("return arguments[0].value;", field)
         if (actual or "").strip() != date_str:
-            debug(f"⚠ {selector} reads {actual!r} instead of {date_str!r} — correcting via DOM.")
-            js_set_value(driver, field, date_str)
-    except WebDriverException as err:
-        _reraise_if_dead(err)
-
-    random_pause(0.3, 0.6)
+            raise Exception(f"Could not set {selector} to {date_str} — field reads {actual!r}")
 
 
 def human_select_dropdown(driver, selector: str, option_text: str):
@@ -453,6 +449,59 @@ def fill_applicant_fields(driver):
 # ============================================================================
 # SLOT SCANNER
 # ============================================================================
+def reset_search_result_state(driver):
+    """
+    Wipes the previous search's output before firing a new one.
+
+    Without this, a short wait is dangerous: if the new search hasn't returned
+    yet, every check below would read the *previous* date's result and report
+    it against the new date. Clearing first means "still empty" is
+    unambiguously "not back yet" rather than "no slots".
+    """
+    try:
+        driver.execute_script("""
+            var msg = document.querySelector('#resultMessage');
+            if (msg) msg.classList.add('hidden');
+            var box = document.querySelector('#appointment_box');
+            if (box) box.classList.add('hidden');
+            var rd = document.querySelector('#resultDiv');
+            if (rd) rd.innerHTML = '';
+        """)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+
+
+def wait_for_search_result(driver, timeout=None) -> bool:
+    """
+    Polls until the search produces output, returning the moment it does.
+
+    Replaces a flat sleep: most searches answer in well under a second, so this
+    is both faster than the old fixed wait and safer than simply shortening it.
+    """
+    if timeout is None:
+        timeout = SEARCH_RESULT_WAIT_SECONDS
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if driver.execute_script("""
+                var msg = document.querySelector('#resultMessage');
+                if (msg && !msg.classList.contains('hidden')) return true;
+                if (document.querySelectorAll('#resultDiv .appointment_slot').length > 0) return true;
+                var box = document.querySelector('#appointment_box');
+                if (box && !box.classList.contains('hidden')) return true;
+                var modals = document.querySelectorAll('.modal.in, .modal.show, .bootbox.modal');
+                for (var i = 0; i < modals.length; i++) {
+                    if (getComputedStyle(modals[i]).display !== 'none') return true;
+                }
+                return false;
+            """):
+                return True
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+        time.sleep(0.15)
+    return False
+
+
 def check_slots_available(driver) -> bool:
     """Returns True if free appointment slots (.appointment_slot_enabled) exist."""
     slot_count = driver.execute_script(
@@ -471,10 +520,63 @@ def is_no_appointment_message(driver) -> bool:
     return is_visible
 
 
+def read_visible_modal_text(driver) -> str:
+    """Returns the text of any modal currently on screen ('' if none)."""
+    try:
+        return driver.execute_script("""
+            var modals = document.querySelectorAll('.modal.in, .modal.show, .bootbox.modal');
+            for (var i = 0; i < modals.length; i++) {
+                if (getComputedStyle(modals[i]).display === 'none') continue;
+                return (modals[i].innerText || '').replace(/\\s+/g, ' ').trim();
+            }
+            return '';
+        """) or ""
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return ""
+
+
+def verify_otp_requested(driver, timeout=20) -> bool:
+    """
+    Confirms the portal actually accepted the OTP request.
+
+    The old code announced "OTP request sent!" the moment the click landed,
+    which is not the same thing: the site can refuse with a validation modal
+    (terms unchecked, reCAPTCHA unsolved, slot expired) and no SMS goes out.
+    The user then waits for a code that never arrives.
+
+    Evidence of acceptance = the OTP entry field becoming available.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if driver.execute_script("""
+                var input = document.querySelector('#onetimepassword');
+                if (!input) return false;
+                var wrap = document.querySelector('#onetimepassword-wrap') || input.parentElement;
+                if (wrap && wrap.classList.contains('hidden')) return false;
+                return input.offsetParent !== null || getComputedStyle(input).display !== 'none';
+            """):
+                return True
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+
+        modal_text = read_visible_modal_text(driver)
+        if modal_text:
+            debug(f"⚠ Portal refused the OTP request: {modal_text[:200]}")
+            dismiss_modal_if_any(driver, timeout=3)
+            return False
+
+        time.sleep(0.4)
+
+    debug("⚠ OTP entry field never appeared within 20s.")
+    return False
+
+
 def select_slot_and_request_otp(driver):
     """
-    Auto-selects the first available slot, checks Terms of Use,
-    and clicks 'Request OTP code (via Mobile) for Appointment'.
+    Auto-selects the first available slot, checks Terms of Use, and requests
+    the SMS OTP. Returns True only if the portal confirmed the OTP request.
     """
     # Step 1: Click the first available (enabled) slot
     debug("Auto-selecting the first available slot...")
@@ -500,7 +602,7 @@ def select_slot_and_request_otp(driver):
             debug("⚠ Slot click registered but no .appointment_slot_selected found — continuing anyway...")
     except Exception as e:
         debug(f"⚠ Could not auto-select slot: {e}")
-        return
+        return False
 
     human_mouse_move(driver)
     random_pause(0.5, 1.0)
@@ -509,16 +611,18 @@ def select_slot_and_request_otp(driver):
     debug("Checking 'Terms of Use' checkbox (#submitinfo)...")
     try:
         checkbox = driver.find_element(By.CSS_SELECTOR, "#submitinfo")
-        is_checked = checkbox.is_selected()
-        if not is_checked:
+        if not checkbox.is_selected():
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
             random_pause(0.3, 0.6)
             # Use JS click since the checkbox may be styled/hidden behind a label
             driver.execute_script("arguments[0].click();", checkbox)
             random_pause(0.3, 0.6)
+
+        # Confirm it actually took — the OTP request is refused without it
+        if driver.execute_script("return document.querySelector('#submitinfo').checked;"):
             debug("☑ Terms of Use checkbox checked.")
         else:
-            debug("☑ Terms of Use already checked.")
+            debug("⚠ Terms of Use checkbox did NOT take — the OTP request will likely be refused.")
     except Exception as e:
         debug(f"⚠ Could not check Terms checkbox: {e}")
 
@@ -528,13 +632,28 @@ def select_slot_and_request_otp(driver):
     # Step 3: Click 'Request OTP code (via Mobile) for Appointment'
     debug("Clicking 'Request OTP' button (#btn-onetimepassword)...")
     try:
-        safe_click(driver, "#btn-onetimepassword", "#btn-onetimepassword (Request OTP)")
-        random_pause(1.0, 2.0)
-        debug("📲 OTP request sent! Check your mobile for the SMS code.")
+        clicked = safe_click(driver, "#btn-onetimepassword", "#btn-onetimepassword (Request OTP)")
     except Exception as e:
         debug(f"⚠ Could not click OTP button: {e}")
+        return False
 
+    if not clicked:
+        debug("⚠ OTP button could not be clicked — NO OTP was requested.")
+        return False
+
+    # Verify the site actually accepted the request. Never claim an SMS was
+    # sent on the strength of a click landing — the user acts on this message.
+    if verify_otp_requested(driver):
+        print("\n" + "📲" * 30)
+        print("  ✅ OTP REQUESTED — check your mobile for the SMS code.")
+        print("  Enter it in the Chrome window to finish the booking.")
+        print("📲" * 30 + "\n")
+        human_mouse_move(driver)
+        return True
+
+    debug("⚠ OTP request did not confirm — no SMS may have been sent. Check the Chrome window.")
     human_mouse_move(driver)
+    return False
 
 
 def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
@@ -596,14 +715,13 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
         debug(f"Setting Appointment Date to: {date_str}")
         human_type_date(driver, "#datefrom", date_str)
-        random_pause(0.5, 1.0)
 
         debug("Clicking 'Search' button (#btn-search)...")
+        reset_search_result_state(driver)
         safe_click(driver, "#btn-search", "#btn-search (Search)")
-        human_mouse_move(driver)
 
-        debug("Waiting 10 seconds for search results...")
-        time.sleep(10)
+        if not wait_for_search_result(driver):
+            debug(f"No response within {SEARCH_RESULT_WAIT_SECONDS}s for {date_str} — treating as no availability.")
 
         # Check if a validation modal popped up. Asking the DOM directly is
         # cheaper and steadier than N round-trips of is_displayed().
@@ -932,6 +1050,9 @@ def launch_browser_and_login():
     to the appointment form and fills applicant fields.
     Returns (driver, wait) on success, or raises on failure.
     """
+    global _NATIVE_CLICK_WORKS
+    _NATIVE_CLICK_WORKS = True   # fresh session — probe native clicks once more
+
     debug("Launching Chrome Browser via Selenium...")
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
