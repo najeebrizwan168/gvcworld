@@ -59,9 +59,7 @@ if FROZEN:
     print(f"\n{'=' * 60}\n[{datetime.now().isoformat(timespec='seconds')}] App started")
 
 
-APPOINTMENT_TYPE_CHOICES = [
-    {"value": value, "label": label} for value, label in bot.APPOINTMENT_TYPES
-]
+# APPOINTMENT_TYPE_CHOICES is now generated dynamically.
 
 GENDER_CHOICES = [
     {"value": "1", "label": "Female"},
@@ -173,10 +171,15 @@ class App(tk.Tk):
         row += 1
         
         # Row 3
-        ttk.Label(left_frame, text="Nationality:", font=("Arial", 9, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(5, 2), padx=2)
+        ttk.Label(left_frame, text="Nationality:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
+        ttk.Label(left_frame, text="City (VAC):", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
         row += 1
         self.nationality_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.nationality_var, width=47).grid(row=row, column=0, columnspan=2, pady=2, padx=2, sticky="w")
+        ttk.Entry(left_frame, textvariable=self.nationality_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
+        self.city_var = tk.StringVar(value="islamabad")
+        city_cb = ttk.Combobox(left_frame, textvariable=self.city_var, values=["islamabad", "lahore"], state="readonly", width=19)
+        city_cb.grid(row=row, column=1, pady=2, padx=2, sticky="w")
+        self.city_var.trace_add("write", self.update_appointment_types_ui)
         row += 1
         
         # Row 4
@@ -191,13 +194,14 @@ class App(tk.Tk):
         
         # Appointment Types (span across)
         ttk.Label(left_frame, text="Appointment Types:", font=("Arial", 9, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=2); row+=1
+        
+        self.types_frame = ttk.Frame(left_frame)
+        self.types_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        row+=1
+        
         self.type_vars = {}
-        for t in APPOINTMENT_TYPE_CHOICES:
-            var = tk.BooleanVar(value=True)
-            self.type_vars[t["value"]] = var
-            cb = ttk.Checkbutton(left_frame, text=t["label"], variable=var)
-            cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=10); row+=1
-            
+        self.current_appointment_choices = []
+        
         ttk.Separator(left_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky="ew", pady=15); row+=1
         
         # Buttons
@@ -226,6 +230,21 @@ class App(tk.Tk):
         self.log_area = scrolledtext.ScrolledText(right_frame, wrap=tk.WORD, state="disabled", font=("Consolas", 10), bg="#1e1e1e", fg="#cccccc")
         self.log_area.pack(fill=tk.BOTH, expand=True)
 
+    def update_appointment_types_ui(self, *args):
+        for widget in self.types_frame.winfo_children():
+            widget.destroy()
+            
+        city = self.city_var.get()
+        types = bot.get_appointment_types(city)
+        self.current_appointment_choices = [{"value": v, "label": l} for v, l in types]
+        
+        self.type_vars = {}
+        for r, t in enumerate(self.current_appointment_choices):
+            var = tk.BooleanVar(value=True)
+            self.type_vars[t["value"]] = var
+            cb = ttk.Checkbutton(self.types_frame, text=t["label"], variable=var)
+            cb.grid(row=r, column=0, sticky="w", padx=10)
+
     def load_settings(self):
         if not CONFIG_FILE.exists():
             self.username_var.set(bot.USER_EMAIL)
@@ -236,8 +255,10 @@ class App(tk.Tk):
             self.expiry_var.set(bot.APPLICANT_PASSPORT_EXPIRY)
             self.gender_var.set([g["label"] for g in GENDER_CHOICES if g["value"] == bot.APPLICANT_GENDER_VALUE][0] if any(g["value"] == bot.APPLICANT_GENDER_VALUE for g in GENDER_CHOICES) else "Male")
             self.nationality_var.set(bot.APPLICANT_NATIONALITY_TEXT)
+            self.city_var.set(bot.TARGET_CITY if hasattr(bot, "TARGET_CITY") else "islamabad")
             self.start_date_var.set(bot.SCAN_START_DATE_STR or datetime.now().strftime("%d/%m/%Y"))
             self.end_date_var.set(bot.SCAN_END_DATE_STR or (datetime.now() + timedelta(days=4)).strftime("%d/%m/%Y"))
+            self.update_appointment_types_ui()
             return
             
         try:
@@ -249,23 +270,22 @@ class App(tk.Tk):
             self.passport_var.set(data.get("passport_number", bot.APPLICANT_PASSPORT))
             self.expiry_var.set(data.get("passport_expiry", bot.APPLICANT_PASSPORT_EXPIRY))
             
-            g_val = data.get("gender", bot.APPLICANT_GENDER_VALUE)
-            for g in GENDER_CHOICES:
-                if g["value"] == g_val:
-                    self.gender_var.set(g["label"])
-                    break
-            
+            self.gender_var.set([g["label"] for g in GENDER_CHOICES if g["value"] == data.get("gender", bot.APPLICANT_GENDER_VALUE)][0] if any(g["value"] == data.get("gender", bot.APPLICANT_GENDER_VALUE) for g in GENDER_CHOICES) else "Male")
             self.nationality_var.set(data.get("nationality", bot.APPLICANT_NATIONALITY_TEXT))
+            self.city_var.set(data.get("target_city", "islamabad"))
             self.start_date_var.set(data.get("scan_start_date", bot.SCAN_START_DATE_STR or datetime.now().strftime("%d/%m/%Y")))
             self.end_date_var.set(data.get("scan_end_date", bot.SCAN_END_DATE_STR or (datetime.now() + timedelta(days=4)).strftime("%d/%m/%Y")))
             
-            types = data.get("appointment_types", [])
-            if types:
-                selected_vals = [t["value"] for t in types]
-                for v, var in self.type_vars.items():
-                    var.set(v in selected_vals)
-        except Exception:
-            pass
+            self.update_appointment_types_ui()
+            
+            saved_types = data.get("appointment_types", [])
+            saved_values = {t["value"] for t in saved_types}
+            if saved_values:
+                for t in self.current_appointment_choices:
+                    self.type_vars[t["value"]].set(t["value"] in saved_values)
+        except Exception as e:
+            print("Failed to load config:", e)
+            self.update_appointment_types_ui()
 
     def save_settings(self, cfg):
         try:
@@ -278,6 +298,7 @@ class App(tk.Tk):
                 "passport_expiry": cfg["passport_expiry"],
                 "gender": cfg["gender"],
                 "nationality": cfg["nationality"],
+                "target_city": cfg["target_city"],
                 "scan_start_date": cfg["scan_start_date"],
                 "scan_end_date": cfg["scan_end_date"],
                 "appointment_types": cfg["appointment_types"]
@@ -346,6 +367,10 @@ class App(tk.Tk):
             if not nationality:
                 raise ValueError("Nationality is required.")
                 
+            target_city = self.city_var.get().strip().lower()
+            if not target_city:
+                target_city = "islamabad"
+                
             dob = normalize_date(self.dob_var.get(), "Date of birth")
             expiry = normalize_date(self.expiry_var.get(), "Passport expiry")
             
@@ -360,7 +385,7 @@ class App(tk.Tk):
             end_date_str = normalize_date(self.end_date_var.get(), "Scan end date")
                 
             chosen_types = []
-            for t in APPOINTMENT_TYPE_CHOICES:
+            for t in self.current_appointment_choices:
                 if self.type_vars[t["value"]].get():
                     chosen_types.append({"value": t["value"], "label": t["label"]})
                     
@@ -377,6 +402,7 @@ class App(tk.Tk):
                 "passport_expiry": expiry,
                 "gender": gender_val,
                 "nationality": nationality,
+                "target_city": target_city,
                 "scan_start_date": start_date_str,
                 "scan_end_date": end_date_str,
                 "appointment_types": chosen_types
@@ -461,6 +487,7 @@ class App(tk.Tk):
             bot.APPLICANT_PASSPORT_EXPIRY = cfg["passport_expiry"]
             bot.APPLICANT_GENDER_VALUE = cfg["gender"]
             bot.APPLICANT_NATIONALITY_TEXT = cfg["nationality"]
+            bot.TARGET_CITY = cfg["target_city"]
             bot.SCAN_START_DATE_STR = cfg["scan_start_date"]
             bot.SCAN_END_DATE_STR = cfg["scan_end_date"]
             bot.APPOINTMENT_TYPES = [(t["value"], t["label"]) for t in cfg["appointment_types"]]

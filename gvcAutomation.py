@@ -1,3 +1,4 @@
+import re
 import time
 import random
 from datetime import datetime, timedelta
@@ -9,6 +10,11 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    WebDriverException,
+    InvalidSessionIdException,
+    NoSuchWindowException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ============================================================================
@@ -22,6 +28,7 @@ USER_PASS = "980Aa0330"
 # Applicant details
 APPLICANT_FIRST_NAME = ""
 APPLICANT_SURNAME = ""
+TARGET_CITY = "islamabad"
 APPLICANT_DOB = "04/07/2006"                # dd/mm/yyyy
 APPLICANT_PASSPORT = "646446656"
 APPLICANT_PASSPORT_EXPIRY = "04/07/2036"    # dd/mm/yyyy
@@ -29,14 +36,31 @@ APPLICANT_GENDER_VALUE = "2"                # 1=FEMALE, 2=MALE, 3=OTHER
 APPLICANT_NATIONALITY_TEXT = "PAKISTAN"
 
 # Appointment type cycle order (value → label for debug)
-APPOINTMENT_TYPES = [
+APPOINTMENT_TYPES_ISLAMABAD = [
     ("0", "Submission Schengen Visa (Short term – Type C)"),
     ("2", "National visa (Long term - type D)"),
     ("6", "Prime Time (optional service at an additional charge)"),
     ("26", "Long-Term Type D (Seasonal/Dependent Employment)"),
 ]
+
+APPOINTMENT_TYPES_LAHORE = [
+    ("Premium Lounge", "Premium Lounge (optional service at an additional charge)"),
+    ("2", "National visa (Long term - type D)"),
+    ("6", "Prime Time (optional service at an additional charge)"),
+    ("26", "Long-Term Type D (Seasonal/Dependent Employment)"),
+]
+
+APPOINTMENT_TYPES = APPOINTMENT_TYPES_ISLAMABAD.copy()
+
+def get_appointment_types(city: str):
+    return APPOINTMENT_TYPES_LAHORE if city.strip().lower() == "lahore" else APPOINTMENT_TYPES_ISLAMABAD
+
 SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
 SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
+
+
+class SessionLostError(Exception):
+    """Raised when the portal has bounced us back to the login page."""
 
 
 # ============================================================================
@@ -45,7 +69,117 @@ SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
 def debug(msg: str):
     """Prints a timestamped debug line."""
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"  [{ts}] {msg}")
+    try:
+        print(f"  [{ts}] {msg}")
+    except UnicodeEncodeError:
+        # Legacy console codepage (cp1252) can't render the status glyphs —
+        # degrade the line rather than killing the scan over a log message
+        print(f"  [{ts}] {msg.encode('ascii', 'replace').decode('ascii')}")
+
+
+def _reraise_if_dead(err: Exception):
+    """Re-raises errors that mean the browser/session is gone, so the outer
+    auto-recovery loop restarts instead of us silently retrying forever."""
+    if isinstance(err, (InvalidSessionIdException, NoSuchWindowException)):
+        raise err
+
+
+def safe_click(driver, target, description="element") -> bool:
+    """
+    Clicks an element the most reliable way available.
+
+    A native WebDriver click enforces interactability — the element must have a
+    non-zero box, must not be `display:none`/disabled, and must not be covered
+    by anything. Any of those raises and, in the old code, killed the whole run:
+    that is exactly how the profile Save button died with
+    ElementNotInteractableException and the reCAPTCHA checkbox died with
+    ElementClickInterceptedException (a near-transparent full-viewport backdrop
+    was over it).
+
+    The native click is tried first because it keeps the human-like input
+    events; a JS click and then a synthetic MouseEvent sequence take over when
+    the driver refuses, since neither is subject to those checks.
+    """
+    element = driver.find_element(By.CSS_SELECTOR, target) if isinstance(target, str) else target
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+    random_pause(0.2, 0.5)
+
+    try:
+        element.click()
+        return True
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        debug(f"Native click on {description} failed ({type(err).__name__}) — using JS click fallback.")
+
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        debug(f"JS click on {description} succeeded.")
+        return True
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+
+    try:
+        driver.execute_script("""
+            var el = arguments[0];
+            ['mousedown', 'mouseup', 'click'].forEach(function (type) {
+                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+            });
+        """, element)
+        debug(f"Synthetic MouseEvent click on {description} dispatched.")
+        return True
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        debug(f"⚠ All click strategies failed for {description}: {err}")
+        return False
+
+
+def js_set_value(driver, element, text: str):
+    """Sets an input's value straight through the DOM and fires the events the
+    page listens on. Fallback for when keyboard input can't be dispatched."""
+    driver.execute_script("""
+        var el = arguments[0], value = arguments[1];
+        el.value = value;
+        if (window.jQuery) {
+            window.jQuery(el).val(value).trigger('change');
+        }
+        el.dispatchEvent(new Event('input',  {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+    """, element, text)
+
+
+def dismiss_modal_if_any(driver, timeout=8.0) -> bool:
+    """
+    Dismisses a bootstrap/bootbox modal if one is on screen (e.g. the profile
+    save confirmation, or a form-validation error). A modal left up blocks
+    every later click on the page. Returns True if one was dismissed.
+
+    Guard: `.btn.red` is excluded from every selector here — on the profile
+    page that is the destructive `unsubscribe()` control.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            dismissed = driver.execute_script("""
+                var modals = document.querySelectorAll('.modal.in, .modal.show, .bootbox.modal');
+                for (var i = 0; i < modals.length; i++) {
+                    var m = modals[i];
+                    if (getComputedStyle(m).display === 'none') continue;
+                    var btn = m.querySelector('.btn-primary:not(.red), .btn:not(.red), button:not(.red)');
+                    if (btn) { btn.click(); return true; }
+                }
+                return false;
+            """)
+            if dismissed:
+                random_pause(0.5, 1.0)
+                return True
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+        time.sleep(0.5)
+    return False
 
 
 def random_pause(min_s=0.3, max_s=1.0):
@@ -66,23 +200,36 @@ def human_mouse_move(driver):
 
 
 def human_type(driver, element, text: str):
-    """Types text character-by-character with random delays like a real human."""
-    element.click()
+    """Types text character-by-character with random delays like a real human.
+    Falls back to a direct DOM write if the driver refuses keyboard input
+    (readonly/hidden/zero-size fields all reject send_keys)."""
+    try:
+        element.click()
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        driver.execute_script("arguments[0].focus();", element)
     random_pause(0.2, 0.5)
-    element.send_keys(Keys.CONTROL + "a")
-    random_pause(0.05, 0.15)
-    element.send_keys(Keys.BACKSPACE)
-    random_pause(0.2, 0.4)
 
-    for char in text:
-        element.send_keys(char)
-        if random.random() < 0.08:
-            time.sleep(random.uniform(0.3, 0.7))
-        else:
-            time.sleep(random.uniform(0.05, 0.18))
+    try:
+        element.send_keys(Keys.CONTROL + "a")
+        random_pause(0.05, 0.15)
+        element.send_keys(Keys.BACKSPACE)
+        random_pause(0.2, 0.4)
 
-    random_pause(0.2, 0.5)
-    element.send_keys(Keys.TAB)
+        for char in text:
+            element.send_keys(char)
+            if random.random() < 0.08:
+                time.sleep(random.uniform(0.3, 0.7))
+            else:
+                time.sleep(random.uniform(0.05, 0.18))
+
+        random_pause(0.2, 0.5)
+        element.send_keys(Keys.TAB)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        debug(f"Keyboard input rejected ({type(err).__name__}) — writing value via DOM instead.")
+        js_set_value(driver, element, text)
+
     random_pause(0.3, 0.6)
 
 
@@ -92,21 +239,47 @@ def human_type_date(driver, selector: str, date_str: str):
     Click field → triple-click to select all → type date → press Escape → Tab away.
     """
     field = driver.find_element(By.CSS_SELECTOR, selector)
-    field.click()
-    random_pause(0.3, 0.6)
 
-    # Triple-click to select all text in the field
-    ActionChains(driver).double_click(field).click(field).perform()
-    random_pause(0.1, 0.3)
+    try:
+        field.click()
+        random_pause(0.3, 0.6)
 
-    for char in date_str:
-        field.send_keys(char)
-        time.sleep(random.uniform(0.05, 0.15))
+        # Triple-click to select all text in the field
+        try:
+            ActionChains(driver).double_click(field).click(field).perform()
+        except WebDriverException:
+            field.send_keys(Keys.CONTROL + "a")
+        random_pause(0.1, 0.3)
 
-    random_pause(0.3, 0.5)
-    field.send_keys(Keys.ESCAPE)
-    random_pause(0.2, 0.4)
-    field.send_keys(Keys.TAB)
+        for char in date_str:
+            field.send_keys(char)
+            time.sleep(random.uniform(0.05, 0.15))
+
+        random_pause(0.3, 0.5)
+        field.send_keys(Keys.ESCAPE)
+        random_pause(0.2, 0.4)
+        field.send_keys(Keys.TAB)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        debug(f"Datepicker typing rejected ({type(err).__name__}) — writing {selector} via DOM instead.")
+        js_set_value(driver, field, date_str)
+        # Close any datepicker panel the JS write may have left open
+        try:
+            driver.execute_script(
+                "if (window.jQuery && jQuery.datepicker) { jQuery.datepicker._hideDatepicker(); }"
+            )
+        except WebDriverException:
+            pass
+
+    # Verify the field actually holds the date we asked for
+    try:
+        actual = driver.execute_script("return arguments[0].value;", field)
+        if (actual or "").strip() != date_str:
+            debug(f"⚠ {selector} reads {actual!r} instead of {date_str!r} — correcting via DOM.")
+            js_set_value(driver, field, date_str)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+
     random_pause(0.3, 0.6)
 
 
@@ -177,6 +350,8 @@ def handle_recaptcha(driver):
     """Attempts to auto-click the reCAPTCHA checkbox inside its iframe."""
     debug("Attempting reCAPTCHA checkbox auto-click...")
     try:
+        driver.switch_to.default_content()
+
         # Find the reCAPTCHA iframe
         wait = WebDriverWait(driver, 10)
         recaptcha_iframe = wait.until(
@@ -188,20 +363,27 @@ def handle_recaptcha(driver):
         driver.switch_to.frame(recaptcha_iframe)
         random_pause(0.5, 1.5)
 
-        # Click the reCAPTCHA checkbox
+        # Click the reCAPTCHA checkbox. A leftover challenge backdrop (a fixed,
+        # full-viewport, near-transparent div at z-index 2000000000) can swallow
+        # a native click, so safe_click's JS fallback does the work there.
         checkbox = wait.until(
-            EC.element_to_be_clickable((
+            EC.presence_of_element_located((
                 By.CSS_SELECTOR,
                 "#recaptcha-anchor, .recaptcha-checkbox-border"
             ))
         )
-        checkbox.click()
-        debug("reCAPTCHA checkbox clicked automatically!")
+        if safe_click(driver, checkbox, "reCAPTCHA checkbox"):
+            debug("reCAPTCHA checkbox clicked automatically!")
+        else:
+            debug("reCAPTCHA checkbox could not be clicked — solve it manually in Chrome.")
 
         # Switch back to main content
         driver.switch_to.default_content()
     except Exception as err:
-        driver.switch_to.default_content()
+        try:
+            driver.switch_to.default_content()
+        except WebDriverException:
+            pass
         debug(f"reCAPTCHA auto-click skipped — manual check may be needed ({err}).")
 
 
@@ -216,17 +398,30 @@ def fill_applicant_fields(driver):
 
     human_mouse_move(driver)
 
+    # presence, not element_to_be_clickable — the latter adds visibility and
+    # enabled checks that turn a slow render into a hard 30s failure, and the
+    # typing helpers below already fall back to a DOM write if input is refused
+    WebDriverWait(driver, 30).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "#gp_passportnumber"))
+    )
+
     if APPLICANT_FIRST_NAME:
         debug(f"Filling First Name: {APPLICANT_FIRST_NAME}")
         first_name_field = driver.find_element(By.CSS_SELECTOR, "#gp_firstname")
-        first_name_field.clear()
+        try:
+            first_name_field.clear()
+        except WebDriverException as err:
+            _reraise_if_dead(err)
         human_type(driver, first_name_field, APPLICANT_FIRST_NAME)
         human_mouse_move(driver)
-        
+
     if APPLICANT_SURNAME:
         debug(f"Filling Surname: {APPLICANT_SURNAME}")
         surname_field = driver.find_element(By.CSS_SELECTOR, "#gp_surname")
-        surname_field.clear()
+        try:
+            surname_field.clear()
+        except WebDriverException as err:
+            _reraise_if_dead(err)
         human_type(driver, surname_field, APPLICANT_SURNAME)
         human_mouse_move(driver)
 
@@ -285,9 +480,7 @@ def select_slot_and_request_otp(driver):
     debug("Auto-selecting the first available slot...")
     try:
         first_slot = driver.find_element(By.CSS_SELECTOR, "#resultDiv .appointment_slot_enabled")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", first_slot)
-        random_pause(0.5, 1.0)
-        first_slot.click()
+        safe_click(driver, first_slot, "first available slot")
         random_pause(1.0, 2.0)
 
         # Verify slot was selected
@@ -335,10 +528,7 @@ def select_slot_and_request_otp(driver):
     # Step 3: Click 'Request OTP code (via Mobile) for Appointment'
     debug("Clicking 'Request OTP' button (#btn-onetimepassword)...")
     try:
-        otp_btn = driver.find_element(By.CSS_SELECTOR, "#btn-onetimepassword")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", otp_btn)
-        random_pause(0.5, 1.0)
-        otp_btn.click()
+        safe_click(driver, "#btn-onetimepassword", "#btn-onetimepassword (Request OTP)")
         random_pause(1.0, 2.0)
         debug("📲 OTP request sent! Check your mobile for the SMS code.")
     except Exception as e:
@@ -358,7 +548,10 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     print("=" * 60)
 
     debug(f"Selecting appointment type: {type_label}...")
-    human_select_dropdown_by_value(driver, "#type", type_value)
+    if type_value == "Premium Lounge":
+        human_select_dropdown(driver, "#type", type_label)
+    else:
+        human_select_dropdown_by_value(driver, "#type", type_value)
     random_pause(1.5, 2.5)
     human_mouse_move(driver)
 
@@ -406,41 +599,34 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
         random_pause(0.5, 1.0)
 
         debug("Clicking 'Search' button (#btn-search)...")
-        search_btn = driver.find_element(By.CSS_SELECTOR, "#btn-search")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", search_btn)
-        random_pause(0.2, 0.5)
-        search_btn.click()
+        safe_click(driver, "#btn-search", "#btn-search (Search)")
         human_mouse_move(driver)
 
         debug("Waiting 10 seconds for search results...")
         time.sleep(10)
 
-        # Check if a validation modal popped up
+        # Check if a validation modal popped up. Asking the DOM directly is
+        # cheaper and steadier than N round-trips of is_displayed().
         modal_visible = False
         try:
-            modals = driver.find_elements(
-                By.CSS_SELECTOR,
-                ".modal.in, .modal.show, .bootbox.modal"
-            )
-            for modal in modals:
-                if modal.is_displayed():
-                    modal_visible = True
-                    break
-        except Exception:
-            pass
+            modal_visible = driver.execute_script("""
+                var modals = document.querySelectorAll('.modal.in, .modal.show, .bootbox.modal');
+                for (var i = 0; i < modals.length; i++) {
+                    if (getComputedStyle(modals[i]).display !== 'none') return true;
+                }
+                return false;
+            """)
+        except WebDriverException as err:
+            _reraise_if_dead(err)
 
         if modal_visible:
             debug("⚠ Validation modal detected! Dismissing it...")
-            try:
-                dismiss_btn = driver.find_element(
-                    By.CSS_SELECTOR,
-                    ".modal .btn, .bootbox .btn-primary, .modal button"
-                )
-                dismiss_btn.click()
-                random_pause(0.5, 1.0)
-            except Exception:
-                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                random_pause(0.3, 0.5)
+            if not dismiss_modal_if_any(driver, timeout=5):
+                try:
+                    ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                    random_pause(0.3, 0.5)
+                except WebDriverException:
+                    pass
             debug("Validation error — some required fields may be missing. Continuing...")
             continue
 
@@ -465,13 +651,17 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
             select_slot_and_request_otp(driver)
             return True
 
-        # Check if result box is visible
+        # Check if result box is visible ('.hidden' is the app's own show/hide
+        # toggle, so it is the authoritative state signal here)
         box_visible = False
         try:
-            appointment_box = driver.find_element(By.CSS_SELECTOR, "#appointment_box")
-            box_visible = appointment_box.is_displayed()
-        except Exception:
-            pass
+            box_visible = driver.execute_script("""
+                var box = document.querySelector('#appointment_box');
+                if (!box) return false;
+                return !box.classList.contains('hidden') && getComputedStyle(box).display !== 'none';
+            """)
+        except WebDriverException as err:
+            _reraise_if_dead(err)
 
         if box_visible:
             debug(f"Results panel visible on {date_str} but no free slots detected. Checking again...")
@@ -500,6 +690,239 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
 
 # ============================================================================
+# VAC SYNC
+# ============================================================================
+def ensure_vac(driver):
+    """Ensures the profile's VAC matches the target city before booking."""
+    print("\n" + "=" * 60)
+    print("[STEP] SYNCHRONIZING VAC CITY")
+    print("=" * 60)
+    
+    vac_map = {"islamabad": "137", "lahore": "138"}
+    target_city = TARGET_CITY.lower()
+    if target_city not in vac_map:
+        raise ValueError(f"Unknown target city: {target_city}")
+    
+    target_id = vac_map[target_city]
+    
+    # 1. Fast pre-check: Read current VAC from the sidebar display string
+    #    ("===najeeb21===  VAC:[Lahore]") — present on every authenticated page.
+    try:
+        sidebar_text = driver.find_element(By.TAG_NAME, "body").text
+        match = re.search(r"VAC:\s*\[([^\]]+)\]", sidebar_text)
+        if match and match.group(1).strip().lower().startswith(target_city):
+            debug(f"VAC already set to {target_city.capitalize()} (sidebar text match). Skipping sync.")
+            return False
+    except Exception:
+        pass # Fallback to profile page
+
+    debug(f"Checking VAC from profile page to ensure it's {target_city.capitalize()}...")
+    
+    # 2. Get Profile URL
+    try:
+        profile_url = driver.find_element(By.CSS_SELECTOR, "#manage-account").get_attribute("href")
+    except Exception:
+        raise Exception("Could not locate #manage-account to find profile URL.")
+        
+    driver.get(profile_url)
+    
+    # Wait for #vac
+    wait = WebDriverWait(driver, 30)
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#vac")))
+    
+    # Snapshot script
+    snapshot_script = """
+    const SNAPSHOT_FIELDS = ['username','firstname','lastname','email','country',
+                             'newpassword','verifypassword','language','timezone',
+                             'phonenumberprefix','phonenumber','id'];
+    return Object.fromEntries(
+        SNAPSHOT_FIELDS.map(id => [id, document.getElementById(id)?.value ?? null])
+    );
+    """
+    
+    # Wait for values to populate
+    def check_populated(d):
+        val = d.execute_script("return document.getElementById('vac').value;")
+        return val is not None and val != ""
+    wait.until(check_populated)
+    
+    current_vac = driver.execute_script("return document.getElementById('vac').value;")
+    if current_vac == target_id:
+        debug(f"VAC already set to {target_city.capitalize()} (value={target_id}). Skipping sync.")
+        return False
+        
+    debug(f"VAC drift detected: current={current_vac}, target={target_id}. Updating profile...")
+    
+    before_snap = driver.execute_script(snapshot_script)
+    if before_snap.get("newpassword") != "" or before_snap.get("verifypassword") != "":
+        raise Exception("Password fields are not empty; aborting VAC sync.")
+        
+    # Change ONLY #vac
+    driver.execute_script(f"""
+        if (window.jQuery) {{
+            window.jQuery('#vac').val('{target_id}').trigger('change');
+        }} else {{
+            const s = document.getElementById('vac');
+            s.value = '{target_id}';
+            s.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+    """)
+    
+    # Verify widget updated
+    time.sleep(1)
+    native_val = driver.execute_script("return document.getElementById('vac').value;")
+    widget_text = driver.execute_script("return document.querySelector('#vac-wrap .select2-selection__rendered').textContent;")
+    
+    if native_val != target_id or target_city.capitalize() not in widget_text:
+        raise Exception(f"VAC change failed to apply to UI widget. native: {native_val}, widget: {widget_text}")
+        
+    after_snap = driver.execute_script(snapshot_script)
+    drift = [k for k in before_snap.keys() if before_snap[k] != after_snap[k]]
+    if drift:
+        raise Exception(f"Unexpected field drift in profile: {', '.join(drift)}")
+        
+    debug("VAC updated in form. Clicking Save...")
+    save_btn = driver.find_element(By.CSS_SELECTOR, "#btn-newuser")
+    if not safe_click(driver, save_btn, "#btn-newuser (Save profile)"):
+        # Last resort: the button is `type="button" onclick="saveprofile(this)"`,
+        # there is no native form submit — call the page's own handler.
+        debug("Save button unclickable — invoking saveprofile() directly...")
+        driver.execute_script("""
+            var btn = document.getElementById('btn-newuser');
+            if (typeof window.saveprofile !== 'function') {
+                throw new Error('saveprofile() is not available on this page');
+            }
+            window.saveprofile(btn);
+        """)
+
+    # Wait for save result — the site may raise a confirmation/error modal
+    debug("Waiting for the profile save to complete...")
+    if dismiss_modal_if_any(driver, timeout=10):
+        debug("Dismissed the post-save modal.")
+    time.sleep(5)
+
+    # Verify from a fresh load, not from in-page state (one retry — the save
+    # is asynchronous and can land a moment after the click)
+    new_vac = None
+    for attempt in (1, 2):
+        driver.get(profile_url)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#vac")))
+        wait.until(check_populated)
+        new_vac = driver.execute_script("return document.getElementById('vac').value;")
+        if new_vac == target_id:
+            break
+        if attempt == 1:
+            debug(f"VAC still reads {new_vac} — re-checking in 5s...")
+            time.sleep(5)
+
+    if new_vac != target_id:
+        raise Exception(f"VAC save failed! Expected {target_id}, got {new_vac}")
+
+    debug(f"VAC successfully synced to {target_city.capitalize()}.")
+    return True
+
+
+
+# ============================================================================
+# APPOINTMENT PAGE LOADING
+# ============================================================================
+def wait_for_appointment_form(driver, timeout=90) -> bool:
+    """
+    Polls for the appointment form's *real* readiness.
+
+    This replaces `EC.visibility_of_element_located('#appointment')`, which had
+    two problems: it waits on the <form> wrapper rather than the controls the
+    scanner actually drives, and on timeout it raises a TimeoutException with an
+    empty message — telling you nothing about why the page didn't come up.
+
+    Here we poll for the specific controls, and distinguish the real failure
+    modes: a session bounce back to the login page raises SessionLostError so
+    the outer loop re-logs-in, anything else returns False so the caller can
+    reload and retry.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if driver.execute_script("""
+                return !!(document.querySelector('#appointment')
+                          && document.querySelector('#type')
+                          && document.querySelector('#datefrom')
+                          && document.querySelector('#gp_passportnumber'));
+            """):
+                return True
+
+            if driver.execute_script(
+                "return !!(document.querySelector('#password') && document.querySelector('#username'));"
+            ):
+                raise SessionLostError("Portal bounced back to the login page — session expired.")
+        except SessionLostError:
+            raise
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+        time.sleep(0.5)
+    return False
+
+
+def describe_page(driver) -> str:
+    """A one-line summary of whatever is actually on screen. Used when a wait
+    fails, so the log says what went wrong instead of raising a bare
+    TimeoutException with an empty message."""
+    try:
+        info = driver.execute_script("""
+            var body = document.body ? (document.body.innerText || '').trim() : '';
+            return {
+                url:   location.href,
+                title: document.title,
+                has:   ['#appointment', '#type', '#datefrom', '#username', '#password']
+                         .filter(function (s) { return !!document.querySelector(s); }),
+                text:  body.replace(/\\s+/g, ' ').slice(0, 220)
+            };
+        """)
+        return (f"url={info['url']} | title={info['title']!r} | "
+                f"present={info['has']} | body={info['text']!r}")
+    except WebDriverException as err:
+        return f"(could not inspect page: {type(err).__name__})"
+
+
+def open_appointment_page(driver, attempts=3):
+    """Navigates to the Book Appointment form, retrying with a reload if the
+    client-side render doesn't complete. Always a fresh navigation — the page
+    caches the VAC at load time (see profile/VAC notes)."""
+    for attempt in range(1, attempts + 1):
+        debug(f"Navigating to 'Book Appointment' section (attempt {attempt}/{attempts}): {APPOINTMENT_URL}...")
+        driver.get(APPOINTMENT_URL)
+
+        debug("Waiting for appointment form to render (up to 90s)...")
+        if wait_for_appointment_form(driver, timeout=90):
+            debug("Appointment form (#appointment) is loaded and ready!")
+            return True
+
+        debug(f"⚠ Appointment form did not render within 90s (attempt {attempt}/{attempts}).")
+        debug(f"   Page state: {describe_page(driver)}")
+        if dismiss_modal_if_any(driver, timeout=3):
+            debug("   Dismissed a modal that was blocking the page.")
+        random_pause(3.0, 6.0)
+
+    raise Exception(
+        f"Appointment form (#appointment) never rendered after {attempts} attempts. "
+        f"Last page state: {describe_page(driver)}"
+    )
+
+
+def assert_vac_on_appointment_page(driver):
+    """Hard gate: never fall through into booking with a mismatched VAC."""
+    debug("Asserting VAC is correctly set on /appointments/add...")
+    vac_map = {"islamabad": "137", "lahore": "138"}
+    expected = vac_map[TARGET_CITY.lower()]
+
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#vac")))
+    loaded_vac = driver.execute_script("return document.getElementById('vac').value;")
+    if loaded_vac != expected:
+        raise Exception(f"FATAL: Appointment form loaded with VAC {loaded_vac}, expected {expected}")
+    debug(f"VAC gate passed — appointment form is querying {TARGET_CITY.capitalize()} ({expected}).")
+
+
+# ============================================================================
 # BROWSER LAUNCH + LOGIN (reusable for auto-recovery)
 # ============================================================================
 def launch_browser_and_login():
@@ -512,7 +935,22 @@ def launch_browser_and_login():
     debug("Launching Chrome Browser via Selenium...")
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
+    # Guarantee a real viewport even when the window is hidden off-screen
+    options.add_argument("--window-size=1920,1080")
+
+    # ── Keep the renderer at full speed while the window is hidden ──
+    # win_hide puts the window through SW_HIDE, so Chrome backgrounds the
+    # renderer and throttles JS timers to ~1/sec. This page is client-rendered
+    # and polls over XHR, so throttling makes it render far slower than it does
+    # on screen. These flags keep a hidden tab running at foreground priority.
+    options.add_argument("--disable-features=CalculateNativeWinOcclusion")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-ipc-flooding-protection")
+
     # Anti-detection flags
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
@@ -581,27 +1019,15 @@ def launch_browser_and_login():
 
     debug("Waiting 15 seconds for dashboard to stabilize...")
     time.sleep(15)
+    
+    # Sync VAC before booking
+    ensure_vac(driver)
 
-    debug("Navigating to 'Book Appointment' section...")
-    try:
-        book_app_link = wait.until(
-            EC.visibility_of_element_located((
-                By.CSS_SELECTOR,
-                "#menu-appointments-add a, a[href*='/appointments/add']"
-            ))
-        )
-        random_pause(0.5, 1.0)
-        book_app_link.click()
-        debug("Clicked 'Book Appointment' sidebar link successfully!")
-    except Exception:
-        debug("Sidebar click failed. Navigating directly to appointment URL...")
-        driver.get(APPOINTMENT_URL)
+    # ALWAYS a fresh navigation — the page caches the VAC at load time
+    open_appointment_page(driver)
 
-    debug("Waiting for appointment form to load (up to 120s)...")
-    WebDriverWait(driver, 120).until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, "#appointment"))
-    )
-    debug("Appointment form (#appointment) is visible and ready!")
+    # Hard gate assert VAC
+    assert_vac_on_appointment_page(driver)
 
     random_pause(1.5, 2.5)
     human_mouse_move(driver)
@@ -659,7 +1085,16 @@ def main():
                 print("🔄" * 30)
 
                 slots_found = False
-                for type_value, type_label in APPOINTMENT_TYPES:
+                
+                # Fetch dynamically based on global TARGET_CITY
+                current_types = get_appointment_types(TARGET_CITY)
+                
+                # Filter to only run types that the user checked in the UI
+                # APPOINTMENT_TYPES acts as the "enabled" list coming from the GUI
+                enabled_values = {v for v, l in APPOINTMENT_TYPES}
+                types_to_scan = [t for t in current_types if t[0] in enabled_values]
+                
+                for type_value, type_label in types_to_scan:
                     # Health-check before each type
                     if not is_browser_alive(driver):
                         raise Exception("Browser window was closed or crashed — restarting...")
@@ -685,15 +1120,12 @@ def main():
                     if not is_browser_alive(driver):
                         raise Exception("Browser window was closed — restarting...")
                     debug("Re-navigating to appointment form for next round...")
-                    driver.get(APPOINTMENT_URL)
-                    random_pause(3.0, 5.0)
                     try:
-                        WebDriverWait(driver, 120).until(
-                            EC.visibility_of_element_located((By.CSS_SELECTOR, "#appointment"))
-                        )
+                        open_appointment_page(driver)
+                        assert_vac_on_appointment_page(driver)
                         fill_applicant_fields(driver)
-                    except Exception:
-                        debug("Could not reload appointment form — will restart browser.")
+                    except Exception as reload_err:
+                        debug(f"Could not reload appointment form ({reload_err}) — will restart browser.")
                         raise Exception("Appointment form reload failed — restarting...")
                 else:
                     print("\n" + "-" * 60)
