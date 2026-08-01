@@ -20,6 +20,8 @@ USER_EMAIL = "najeeb21"
 USER_PASS = "980Aa0330"
 
 # Applicant details
+APPLICANT_FIRST_NAME = ""
+APPLICANT_SURNAME = ""
 APPLICANT_DOB = "04/07/2006"                # dd/mm/yyyy
 APPLICANT_PASSPORT = "646446656"
 APPLICANT_PASSPORT_EXPIRY = "04/07/2036"    # dd/mm/yyyy
@@ -33,8 +35,8 @@ APPOINTMENT_TYPES = [
     ("6", "Prime Time (optional service at an additional charge)"),
     ("26", "Long-Term Type D (Seasonal/Dependent Employment)"),
 ]
-
-DAYS_TO_SCAN = 4
+SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
+SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
 
 
 # ============================================================================
@@ -214,6 +216,20 @@ def fill_applicant_fields(driver):
 
     human_mouse_move(driver)
 
+    if APPLICANT_FIRST_NAME:
+        debug(f"Filling First Name: {APPLICANT_FIRST_NAME}")
+        first_name_field = driver.find_element(By.CSS_SELECTOR, "#gp_firstname")
+        first_name_field.clear()
+        human_type(driver, first_name_field, APPLICANT_FIRST_NAME)
+        human_mouse_move(driver)
+        
+    if APPLICANT_SURNAME:
+        debug(f"Filling Surname: {APPLICANT_SURNAME}")
+        surname_field = driver.find_element(By.CSS_SELECTOR, "#gp_surname")
+        surname_field.clear()
+        human_type(driver, surname_field, APPLICANT_SURNAME)
+        human_mouse_move(driver)
+
     debug(f"Filling Date of Birth: {APPLICANT_DOB}")
     human_type_date(driver, "#gp_dateofbirth", APPLICANT_DOB)
     human_mouse_move(driver)
@@ -363,13 +379,27 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     except Exception:
         pass
 
+    # Calculate scan range
+    try:
+        start_date = datetime.strptime(SCAN_START_DATE_STR, "%d/%m/%Y")
+        end_date = datetime.strptime(SCAN_END_DATE_STR, "%d/%m/%Y")
+    except ValueError:
+        debug("⚠ Invalid Start or End Date format. Please use dd/mm/yyyy.")
+        return False
+        
+    delta = (end_date - start_date).days
+    if delta < 0:
+        debug("⚠ End Date cannot be before Start Date.")
+        return False
+        
+    days_to_scan = delta + 1
+
     # Scan each day
-    today = datetime.now()
-    for day_offset in range(DAYS_TO_SCAN):
-        target_date = today + timedelta(days=day_offset)
+    for day_offset in range(days_to_scan):
+        target_date = start_date + timedelta(days=day_offset)
         date_str = target_date.strftime("%d/%m/%Y")
 
-        print(f"\n  --- Day {day_offset + 1}/{DAYS_TO_SCAN}: {date_str} ---")
+        print(f"\n  --- Day {day_offset + 1}/{days_to_scan}: {date_str} ---")
 
         debug(f"Setting Appointment Date to: {date_str}")
         human_type_date(driver, "#datefrom", date_str)
@@ -465,7 +495,7 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
         debug(f"✗ No results or slots for {date_str}. Moving to next date...")
 
-    debug(f"✗ No slots found across {DAYS_TO_SCAN} days for type: {type_label}")
+    debug(f"✗ No slots found across {days_to_scan} days for type: {type_label}")
     return False
 
 
@@ -618,7 +648,14 @@ def main():
 
                 print("\n" + "🔄" * 30)
                 print(f"  ══════  SCAN ROUND {round_number}  ══════")
-                print(f"  Checking {len(APPOINTMENT_TYPES)} types × {DAYS_TO_SCAN} days")
+                days_to_scan = 1
+                try:
+                    start_date = datetime.strptime(SCAN_START_DATE_STR, "%d/%m/%Y")
+                    end_date = datetime.strptime(SCAN_END_DATE_STR, "%d/%m/%Y")
+                    days_to_scan = max(1, (end_date - start_date).days + 1)
+                except ValueError:
+                    pass
+                print(f"  Checking {len(APPOINTMENT_TYPES)} types × {days_to_scan} days")
                 print("🔄" * 30)
 
                 slots_found = False
