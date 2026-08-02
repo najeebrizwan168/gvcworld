@@ -71,6 +71,13 @@ SCAN_WEEKDAYS = {}
 # polls and exits as soon as the result lands, so this is a ceiling, not a cost.
 SEARCH_RESULT_WAIT_SECONDS = 3
 
+# Once the results panel is open but shows no free slots, how long to keep
+# looking while it finishes rendering. Polled, so this is a ceiling too.
+PANEL_STABILIZE_SECONDS = 5
+
+# Flat settle after the manual login gate, before touching the dashboard.
+DASHBOARD_STABILIZE_SECONDS = 5
+
 # Latched off the first time this portal refuses a native click (it refuses all
 # of them), so later clicks skip straight to JS. Reset on each browser launch.
 _NATIVE_CLICK_WORKS = True
@@ -223,37 +230,27 @@ def human_mouse_move(driver):
 
 
 def human_type(driver, element, text: str):
-    """Types text character-by-character with random delays like a real human.
-    Falls back to a direct DOM write if the driver refuses keyboard input
-    (readonly/hidden/zero-size fields all reject send_keys)."""
-    try:
-        element.click()
-    except WebDriverException as err:
-        _reraise_if_dead(err)
-        driver.execute_script("arguments[0].focus();", element)
-    random_pause(0.2, 0.5)
+    """
+    Writes text straight into the DOM. No click, no send_keys, no pause.
 
-    try:
-        element.send_keys(Keys.CONTROL + "a")
-        random_pause(0.05, 0.15)
-        element.send_keys(Keys.BACKSPACE)
-        random_pause(0.2, 0.4)
+    Native keyboard input is bypassed entirely by design: this portal's fields
+    are routinely readonly/hidden/zero-size and reject send_keys with
+    ElementNotInteractableException, and typing character-by-character costs one
+    WebDriver round-trip per character for no benefit. js_set_value sets .value
+    and dispatches 'input' and 'change', which is what the page's own handlers
+    listen on, so the field registers immediately.
+    """
+    js_set_value(driver, element, text)
 
-        for char in text:
-            element.send_keys(char)
-            if random.random() < 0.08:
-                time.sleep(random.uniform(0.3, 0.7))
-            else:
-                time.sleep(random.uniform(0.05, 0.18))
-
-        random_pause(0.2, 0.5)
-        element.send_keys(Keys.TAB)
-    except WebDriverException as err:
-        _reraise_if_dead(err)
-        debug(f"Keyboard input rejected ({type(err).__name__}) — writing value via DOM instead.")
-        js_set_value(driver, element, text)
-
-    random_pause(0.3, 0.6)
+    # Confirm it landed. One plain-write retry covers a change handler that
+    # clobbered the value; a field that merely reformats what we wrote (case,
+    # spacing) is the page doing its job, so warn rather than abort the run.
+    actual = driver.execute_script("return arguments[0].value;", element)
+    if (actual or "") != text:
+        driver.execute_script("arguments[0].value = arguments[1];", element, text)
+        actual = driver.execute_script("return arguments[0].value;", element)
+        if (actual or "").strip().upper() != text.strip().upper():
+            debug(f"⚠ Field did not accept the value as written — reads {actual!r}, expected {text!r}")
 
 
 def human_type_date(driver, selector: str, date_str: str):
@@ -291,9 +288,8 @@ def human_select_dropdown(driver, selector: str, option_text: str):
     """Selects a dropdown option by text label, handling both standard and Select2 dropdowns."""
     select_el = driver.find_element(By.CSS_SELECTOR, selector)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", select_el)
-    random_pause(0.2, 0.5)
 
-    # Try native select first
+    # Native selection — this works on these dropdowns without error, so it stays
     try:
         sel = Select(select_el)
         for opt in sel.options:
@@ -320,16 +316,14 @@ def human_select_dropdown(driver, selector: str, option_text: str):
             }}
         }}
     """)
-    random_pause(0.3, 0.6)
 
 
 def human_select_dropdown_by_value(driver, selector: str, value: str):
     """Selects a dropdown option by value, handling both standard and Select2 dropdowns."""
     select_el = driver.find_element(By.CSS_SELECTOR, selector)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", select_el)
-    random_pause(0.2, 0.5)
 
-    # Try native select first
+    # Native selection — this works on these dropdowns without error, so it stays
     try:
         sel = Select(select_el)
         sel.select_by_value(value)
@@ -347,7 +341,6 @@ def human_select_dropdown_by_value(driver, selector: str, value: str):
             }}
         }}
     """)
-    random_pause(0.3, 0.6)
 
 
 def handle_recaptcha(driver):
@@ -409,49 +402,38 @@ def fill_applicant_fields(driver):
         EC.presence_of_element_located((By.CSS_SELECTOR, "#gp_passportnumber"))
     )
 
+    # No pause and no mouse jitter between fields: every write below is a direct
+    # DOM assignment that takes effect the instant it returns, so there is
+    # nothing to wait for. The idle-behaviour move happens once, above.
     if APPLICANT_FIRST_NAME:
         debug(f"Filling First Name: {APPLICANT_FIRST_NAME}")
         first_name_field = driver.find_element(By.CSS_SELECTOR, "#gp_firstname")
-        try:
-            first_name_field.clear()
-        except WebDriverException as err:
-            _reraise_if_dead(err)
         human_type(driver, first_name_field, APPLICANT_FIRST_NAME)
-        human_mouse_move(driver)
 
     if APPLICANT_SURNAME:
         debug(f"Filling Surname: {APPLICANT_SURNAME}")
         surname_field = driver.find_element(By.CSS_SELECTOR, "#gp_surname")
-        try:
-            surname_field.clear()
-        except WebDriverException as err:
-            _reraise_if_dead(err)
         human_type(driver, surname_field, APPLICANT_SURNAME)
-        human_mouse_move(driver)
 
     debug(f"Filling Date of Birth: {APPLICANT_DOB}")
     human_type_date(driver, "#gp_dateofbirth", APPLICANT_DOB)
-    human_mouse_move(driver)
 
     debug(f"Filling Passport Number: {APPLICANT_PASSPORT}")
     passport_field = driver.find_element(By.CSS_SELECTOR, "#gp_passportnumber")
     human_type(driver, passport_field, APPLICANT_PASSPORT)
-    human_mouse_move(driver)
 
     debug(f"Filling Passport Expiry: {APPLICANT_PASSPORT_EXPIRY}")
     human_type_date(driver, "#gp_traveldocumentvaliduntil", APPLICANT_PASSPORT_EXPIRY)
-    human_mouse_move(driver)
 
+    # Dropdowns keep native selection — Select() works on these without error,
+    # so there is no reason to inject values into them by hand.
     debug(f"Setting Gender to MALE (value={APPLICANT_GENDER_VALUE})")
     human_select_dropdown_by_value(driver, "#gp_gender", APPLICANT_GENDER_VALUE)
-    human_mouse_move(driver)
 
     debug("Setting Nationality to PAKISTAN...")
     human_select_dropdown(driver, "#gp_nationality", APPLICANT_NATIONALITY_TEXT)
-    human_mouse_move(driver)
 
     debug("All client information fields filled successfully!")
-    random_pause(0.5, 1.0)
 
 
 # ============================================================================
@@ -508,6 +490,29 @@ def wait_for_search_result(driver, timeout=None) -> bool:
             _reraise_if_dead(err)
         time.sleep(0.15)
     return False
+
+
+def wait_for_slots_to_render(driver, timeout=None) -> bool:
+    """
+    Waits for free slots to appear in an already-open results panel.
+
+    Replaces a blind sleep-then-look-once: the panel can open a moment before
+    its slot buttons are painted, so a single immediate check can miss them.
+    Polling returns the instant a slot shows up, so the ceiling below is the
+    worst case for a genuinely empty panel, not the cost of every check.
+    """
+    if timeout is None:
+        timeout = PANEL_STABILIZE_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if check_slots_available(driver):
+                return True
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.15)
 
 
 def check_slots_available(driver) -> bool:
@@ -835,8 +840,7 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
         if box_visible:
             debug(f"Results panel visible on {date_str} but no free slots detected. Checking again...")
-            random_pause(1.5, 2.5)
-            slots_found = check_slots_available(driver)
+            slots_found = wait_for_slots_to_render(driver)
             if slots_found:
                 slot_count = driver.execute_script(
                     "return document.querySelectorAll('#resultDiv .appointment_slot_enabled').length;"
@@ -1190,8 +1194,8 @@ def launch_browser_and_login():
     input("Press ENTER in terminal ONLY AFTER successful login...")
     debug("Terminal gate passed — login confirmed by user.")
 
-    debug("Waiting 15 seconds for dashboard to stabilize...")
-    time.sleep(15)
+    debug(f"Waiting {DASHBOARD_STABILIZE_SECONDS} seconds for dashboard to stabilize...")
+    time.sleep(DASHBOARD_STABILIZE_SECONDS)
     
     # Sync VAC before booking
     ensure_vac(driver)
