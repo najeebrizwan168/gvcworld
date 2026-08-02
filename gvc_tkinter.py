@@ -185,6 +185,9 @@ class WebDriverProxy:
 
 
 class App(tk.Tk):
+    # Monday-first, matching datetime.weekday() so the index IS the weekday number
+    DAY_TOGGLE_LABELS = ["M", "T", "W", "T", "F", "S", "S"]
+
     def __init__(self):
         super().__init__()
         self.title("GVC Appointment Scanner")
@@ -215,10 +218,39 @@ class App(tk.Tk):
         self.paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True)
 
-        # Left Panel (Settings)
-        left_frame = ttk.Frame(self.paned, padding=10, relief="solid", borderwidth=1)
-        self.paned.add(left_frame, weight=1)
-        
+        # Left Panel (Settings). Scrollable: the per-type weekday rows push the
+        # settings past the window height on a 720p screen, and without this the
+        # Start button ends up below the bottom edge.
+        left_outer = ttk.Frame(self.paned, relief="solid", borderwidth=1)
+        self.paned.add(left_outer, weight=1)
+
+        left_canvas = tk.Canvas(left_outer, highlightthickness=0, borderwidth=0, width=360)
+        left_scroll = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        left_frame = ttk.Frame(left_canvas, padding=10)
+        left_window = left_canvas.create_window((0, 0), window=left_frame, anchor="nw")
+
+        def _sync_left_scroll(_event=None):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+            left_canvas.itemconfigure(
+                left_window,
+                width=max(left_canvas.winfo_width(), left_frame.winfo_reqwidth()))
+
+        left_frame.bind("<Configure>", _sync_left_scroll)
+        left_canvas.bind("<Configure>", _sync_left_scroll)
+
+        # Wheel is bound only while the pointer is over this panel, so it does
+        # not steal scrolling from the console output on the right.
+        def _on_wheel(event):
+            left_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        left_canvas.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", _on_wheel))
+        left_canvas.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+
+
         # Right Panel (Logs)
         right_frame = ttk.Frame(self.paned, padding=10, relief="solid", borderwidth=1)
         self.paned.add(right_frame, weight=3)
@@ -291,6 +323,8 @@ class App(tk.Tk):
         self.range_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=2)
         self.start_date_var.trace_add("write", self.update_range_label)
         self.end_date_var.trace_add("write", self.update_range_label)
+        self.start_date_var.trace_add("write", self.update_type_day_counts)
+        self.end_date_var.trace_add("write", self.update_type_day_counts)
         self.update_range_label()
         row += 1
         
@@ -302,8 +336,10 @@ class App(tk.Tk):
         row+=1
         
         self.type_vars = {}
+        self.weekday_vars = {}
+        self.day_count_labels = {}
         self.current_appointment_choices = []
-        
+
         ttk.Separator(left_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky="ew", pady=15); row+=1
         
         # Buttons
@@ -359,19 +395,79 @@ class App(tk.Tk):
                 foreground="gray" if days <= 30 else "#b06000")
 
     def update_appointment_types_ui(self, *args):
+        # This runs again on every city switch and destroys the old widgets, so
+        # carry the weekday picks over — types 2/6/26 exist in both cities and
+        # the user would otherwise lose their choices just by looking at Lahore.
+        previous = {value: [bit.get() for bit in bits]
+                    for value, bits in self.weekday_vars.items()}
+
         for widget in self.types_frame.winfo_children():
             widget.destroy()
-            
+
         city = self.city_var.get()
         types = bot.get_appointment_types(city)
         self.current_appointment_choices = [{"value": v, "label": l} for v, l in types]
-        
+
         self.type_vars = {}
+        self.weekday_vars = {}
+        self.day_count_labels = {}
         for r, t in enumerate(self.current_appointment_choices):
+            value = t["value"]
+            block = ttk.Frame(self.types_frame)
+            block.grid(row=r, column=0, sticky="w", pady=(0, 5))
+
             var = tk.BooleanVar(value=True)
-            self.type_vars[t["value"]] = var
-            cb = ttk.Checkbutton(self.types_frame, text=t["label"], variable=var)
-            cb.grid(row=r, column=0, sticky="w", padx=10)
+            self.type_vars[value] = var
+            ttk.Checkbutton(block, text=t["label"], variable=var).grid(
+                row=0, column=0, sticky="w", padx=10)
+
+            # Plain tk.Checkbutton, not ttk: indicatoron=0 turns it into a toggle
+            # that visibly stays pressed and honours selectcolor. ttk has no
+            # equivalent without defining a custom theme element.
+            day_row = ttk.Frame(block)
+            day_row.grid(row=1, column=0, sticky="w", padx=(28, 0))
+            saved = previous.get(value, [True] * 7)
+            bits = []
+            for i, name in enumerate(self.DAY_TOGGLE_LABELS):
+                bit = tk.BooleanVar(value=saved[i])
+                bits.append(bit)
+                tk.Checkbutton(day_row, text=name, variable=bit, indicatoron=0,
+                               width=2, font=("Arial", 8), selectcolor="#9ec5fe",
+                               command=self.update_type_day_counts).pack(side=tk.LEFT, padx=1)
+            self.weekday_vars[value] = bits
+
+            count = ttk.Label(day_row, text="", foreground="gray", font=("Arial", 8))
+            count.pack(side=tk.LEFT, padx=(6, 0))
+            self.day_count_labels[value] = count
+
+        self.update_type_day_counts()
+
+    def update_type_day_counts(self, *args):
+        """How many dates in the range each type will actually be searched on."""
+        if not self.day_count_labels:
+            return
+
+        try:
+            start = datetime.strptime(normalize_date(self.start_date_var.get(), "start"), "%d/%m/%Y")
+            end = datetime.strptime(normalize_date(self.end_date_var.get(), "end"), "%d/%m/%Y")
+            total = (end - start).days + 1
+        except Exception:
+            total = 0
+
+        for value, label in self.day_count_labels.items():
+            if total < 1:
+                label.config(text="", foreground="gray")
+                continue
+
+            picked = {i for i, bit in enumerate(self.weekday_vars[value]) if bit.get()}
+            if len(picked) >= 7:
+                label.config(text=f"{total} days", foreground="gray")
+                continue
+
+            matching = sum(1 for offset in range(total)
+                           if (start + timedelta(days=offset)).weekday() in picked)
+            label.config(text=f"{matching} of {total} days",
+                         foreground="red" if matching == 0 else "gray")
 
     def load_settings(self):
         if not CONFIG_FILE.exists():
@@ -412,6 +508,19 @@ class App(tk.Tk):
             if saved_values:
                 for t in self.current_appointment_choices:
                     self.type_vars[t["value"]].set(t["value"] in saved_values)
+
+            # Weekdays arrived after the rest of this config. Entries without them
+            # — including the oldest bare-string format — mean "every day".
+            for saved in saved_types:
+                if not isinstance(saved, dict):
+                    continue
+                bits = self.weekday_vars.get(saved.get("value"))
+                weekdays = saved.get("weekdays")
+                if bits is None or not isinstance(weekdays, list) or not weekdays:
+                    continue
+                for i, bit in enumerate(bits):
+                    bit.set(i in weekdays)
+            self.update_type_day_counts()
         except Exception as e:
             print("Failed to load config:", e)
             self.update_appointment_types_ui()
@@ -515,12 +624,34 @@ class App(tk.Tk):
                 
             chosen_types = []
             for t in self.current_appointment_choices:
-                if self.type_vars[t["value"]].get():
-                    chosen_types.append({"value": t["value"], "label": t["label"]})
-                    
+                if not self.type_vars[t["value"]].get():
+                    continue
+                weekdays = [i for i, bit in enumerate(self.weekday_vars[t["value"]]) if bit.get()]
+                if not weekdays:
+                    raise ValueError(f"{t['label']}: pick at least one weekday.")
+                chosen_types.append({"value": t["value"], "label": t["label"], "weekdays": weekdays})
+
             if not chosen_types:
                 raise ValueError("Pick at least one appointment type.")
-                
+
+            # A type whose weekdays never occur in the range would search nothing
+            # and look like a hang, so catch it here rather than mid-scan.
+            scan_start = datetime.strptime(start_date_str, "%d/%m/%Y")
+            scan_end = datetime.strptime(end_date_str, "%d/%m/%Y")
+            if scan_end < scan_start:
+                raise ValueError("Scan end date is before the scan start date.")
+            range_days = (scan_end - scan_start).days + 1
+            for t in chosen_types:
+                picked = set(t["weekdays"])
+                if len(picked) >= 7:
+                    continue
+                if not any((scan_start + timedelta(days=o)).weekday() in picked
+                           for o in range(range_days)):
+                    raise ValueError(
+                        f"{t['label']}: none of the selected weekdays fall between "
+                        f"{start_date_str} and {end_date_str}.")
+
+
             cfg = {
                 "username": username,
                 "password": password,
@@ -620,6 +751,11 @@ class App(tk.Tk):
             bot.SCAN_START_DATE_STR = cfg["scan_start_date"]
             bot.SCAN_END_DATE_STR = cfg["scan_end_date"]
             bot.APPOINTMENT_TYPES = [(t["value"], t["label"]) for t in cfg["appointment_types"]]
+            # Only restricted types go in — an all-seven type is left out so the
+            # dict stays empty for anyone who never uses the weekday filter.
+            bot.SCAN_WEEKDAYS = {t["value"]: set(t.get("weekdays", []))
+                                 for t in cfg["appointment_types"]
+                                 if 0 < len(t.get("weekdays", [])) < 7}
 
             bot.print = patched_print
             bot.input = patched_input

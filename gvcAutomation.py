@@ -58,6 +58,14 @@ def get_appointment_types(city: str):
 SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
 SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
 
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Per-type weekday restriction, keyed by appointment-type value. Values are sets
+# of ints using datetime.weekday() numbering (Monday=0 … Sunday=6). A type that
+# is absent from this dict has no restriction and is scanned on every date in
+# the range — which is what every caller that never sets it gets.
+SCAN_WEEKDAYS = {}
+
 
 # How long to wait for a search to return before judging the result. The wait
 # polls and exits as soon as the result lands, so this is a ceiling, not a cost.
@@ -656,6 +664,42 @@ def select_slot_and_request_otp(driver):
     return False
 
 
+def dates_for_type(type_value: str, start_date: datetime, end_date: datetime) -> list:
+    """
+    The dates in [start_date, end_date] this appointment type should be searched on.
+
+    Types with no entry in SCAN_WEEKDAYS get the whole range, so the default
+    behaviour is unchanged for any caller that never touches the filter.
+    """
+    every_day = [start_date + timedelta(days=offset)
+                 for offset in range((end_date - start_date).days + 1)]
+
+    allowed = SCAN_WEEKDAYS.get(type_value)
+    if not allowed:
+        return every_day
+    return [d for d in every_day if d.weekday() in allowed]
+
+
+def describe_weekday_filter(type_value: str) -> str:
+    """'Tue, Thu' for a restricted type, empty string when it scans every day."""
+    allowed = SCAN_WEEKDAYS.get(type_value)
+    if not allowed or len(allowed) >= 7:
+        return ""
+    return ", ".join(WEEKDAY_NAMES[d] for d in sorted(allowed))
+
+
+def count_dates_to_scan() -> int:
+    """Total searches one full round will make across every enabled type."""
+    try:
+        start_date = datetime.strptime(SCAN_START_DATE_STR, "%d/%m/%Y")
+        end_date = datetime.strptime(SCAN_END_DATE_STR, "%d/%m/%Y")
+    except ValueError:
+        return 0
+    if end_date < start_date:
+        return 0
+    return sum(len(dates_for_type(v, start_date, end_date)) for v, _ in APPOINTMENT_TYPES)
+
+
 def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     """
     For a given appointment type, scans today + next DAYS_TO_SCAN days for available slots.
@@ -703,15 +747,23 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     if delta < 0:
         debug("⚠ End Date cannot be before Start Date.")
         return False
-        
-    days_to_scan = delta + 1
+
+    dates = dates_for_type(type_value, start_date, end_date)
+    days_to_scan = len(dates)
+
+    weekday_filter = describe_weekday_filter(type_value)
+    if weekday_filter:
+        debug(f"Weekdays: {weekday_filter} — {days_to_scan} of {delta + 1} dates in range")
+    if not dates:
+        debug(f"⚠ No dates in range match the selected weekdays ({weekday_filter}). Skipping this type.")
+        return False
 
     # Scan each day
-    for day_offset in range(days_to_scan):
-        target_date = start_date + timedelta(days=day_offset)
+    for day_index, target_date in enumerate(dates):
         date_str = target_date.strftime("%d/%m/%Y")
 
-        print(f"\n  --- Day {day_offset + 1}/{days_to_scan}: {date_str} ---")
+        print(f"\n  --- Day {day_index + 1}/{days_to_scan}: "
+              f"{WEEKDAY_NAMES[target_date.weekday()]} {date_str} ---")
 
         debug(f"Setting Appointment Date to: {date_str}")
         human_type_date(driver, "#datefrom", date_str)
@@ -1202,7 +1254,14 @@ def main():
                     days_to_scan = max(1, (end_date - start_date).days + 1)
                 except ValueError:
                     pass
-                print(f"  Checking {len(APPOINTMENT_TYPES)} types × {days_to_scan} days")
+                # Weekday filters make "types × days" a lie, so report the real
+                # number of searches this round will actually make.
+                searches = count_dates_to_scan()
+                if searches:
+                    print(f"  Checking {len(APPOINTMENT_TYPES)} types over {days_to_scan} days "
+                          f"— {searches} searches")
+                else:
+                    print(f"  Checking {len(APPOINTMENT_TYPES)} types × {days_to_scan} days")
                 print("🔄" * 30)
 
                 slots_found = False
