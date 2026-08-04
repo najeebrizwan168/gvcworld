@@ -81,6 +81,186 @@ def normalize_date(raw: str, field: str) -> str:
     raise ValueError(f"{field} must look like dd/mm/yyyy - got {value!r}")
 
 
+# ---------------------------------------------------------------------------
+# Look and feel
+# ---------------------------------------------------------------------------
+# Deep navy with a red accent and a gold hairline — the palette a German
+# consular service actually uses, so the tool reads as part of that world
+# rather than as a generic utility.
+PALETTE = {
+    "page":      "#f4f5f7",   # window background
+    "card":      "#ffffff",   # panel background
+    "header":    "#10284b",   # title bar
+    "header_dim": "#8fa6c4",  # subtitle on the title bar
+    "primary":   "#1b3a6b",
+    "primary_hi": "#26518f",  # hover
+    "primary_lo": "#122a4e",  # pressed
+    "accent":    "#c8102e",   # stop / errors only
+    "accent_hi": "#fdecee",
+    "accent_lo": "#f7ccd3",
+    "gold":      "#d4a017",
+    "gold_hi":   "#e5b52c",
+    "gold_lo":   "#b3860f",
+    "text":      "#1c2430",
+    "muted":     "#6b7684",
+    "border":    "#dfe3e9",
+    "field":     "#c6ccd6",
+    "sunken":    "#eef0f4",   # unselected toggle
+    "hover":     "#eef2f8",
+    "ok":        "#1a7f37",
+    "warn":      "#b06000",
+}
+
+FONT_UI    = ("Segoe UI", 9)
+FONT_SMALL = ("Segoe UI", 8)
+FONT_LABEL = ("Segoe UI", 8, "bold")
+FONT_CARD  = ("Segoe UI", 9, "bold")
+FONT_TITLE = ("Segoe UI", 15, "bold")
+FONT_BTN   = ("Segoe UI", 9, "bold")
+FONT_LOG   = ("Consolas", 9)
+
+
+def mix(colour_a: str, colour_b: str, t: float) -> str:
+    """Blends two #rrggbb colours. t=0 gives a, t=1 gives b."""
+    a = [int(colour_a[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(colour_b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+BUTTON_KINDS = {
+    # bg, fg, border, hover, pressed
+    "primary": (PALETTE["primary"], "#ffffff", PALETTE["primary"],
+                PALETTE["primary_hi"], PALETTE["primary_lo"]),
+    "danger":  ("#ffffff", PALETTE["accent"], PALETTE["accent"],
+                PALETTE["accent_hi"], PALETTE["accent_lo"]),
+    "gold":    (PALETTE["gold"], "#26200c", PALETTE["gold"],
+                PALETTE["gold_hi"], PALETTE["gold_lo"]),
+    "ghost":   ("#ffffff", PALETTE["primary"], PALETTE["field"],
+                PALETTE["hover"], PALETTE["border"]),
+}
+
+
+class ActionButton(tk.Button):
+    """
+    A flat button that reacts to the pointer: it lifts on hover, sinks on
+    press, and eases back to its resting colour over ~150ms on release.
+
+    Plain tk.Button rather than ttk because ttk on Windows hands button
+    rendering to the native theme engine, which ignores background colours —
+    there is no way to paint a navy button through it.
+    """
+
+    ANIM_STEPS = 6
+    ANIM_MS = 25
+
+    def __init__(self, parent, text, command=None, kind="primary", **kw):
+        bg, fg, border, hover, press = BUTTON_KINDS[kind]
+        self._bg, self._fg, self._hover, self._press = bg, fg, hover, press
+        self._anim = None
+        self._inside = False
+        super().__init__(
+            parent, text=text, command=command, font=FONT_BTN,
+            bg=bg, fg=fg, activebackground=press, activeforeground=fg,
+            disabledforeground=PALETTE["muted"],
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=border, highlightcolor=border, cursor="hand2",
+            padx=kw.pop("padx", 14), pady=kw.pop("pady", 7), **kw)
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # keep the disabled look in step with state changes made by the caller
+    def configure(self, cnf=None, **kw):
+        result = super().configure(cnf, **kw)
+        if (cnf and "state" in cnf) or "state" in kw:
+            self._settle()
+        return result
+
+    config = configure
+
+    def _enabled(self) -> bool:
+        return str(self["state"]) != "disabled"
+
+    def _stop_anim(self):
+        if self._anim is not None:
+            try:
+                self.after_cancel(self._anim)
+            except Exception:
+                pass
+            self._anim = None
+
+    def _settle(self):
+        """Repaint to whatever the resting colour should be right now."""
+        self._stop_anim()
+        if not self._enabled():
+            self.configure(bg=mix(self._bg, PALETTE["page"], 0.65),
+                           cursor="arrow")
+            return
+        self.configure(bg=self._hover if self._inside else self._bg,
+                       cursor="hand2")
+
+    def _on_enter(self, _event=None):
+        self._inside = True
+        if self._enabled():
+            self._stop_anim()
+            self.configure(bg=self._hover)
+
+    def _on_leave(self, _event=None):
+        self._inside = False
+        if self._enabled():
+            self._stop_anim()
+            self.configure(bg=self._bg)
+
+    def _on_press(self, _event=None):
+        if self._enabled():
+            self._stop_anim()
+            self.configure(bg=self._press)
+
+    def _on_release(self, _event=None):
+        if not self._enabled():
+            return
+        target = self._hover if self._inside else self._bg
+        self._ease(self._press, target, 0)
+
+    def _ease(self, start, end, step):
+        if step > self.ANIM_STEPS:
+            self._anim = None
+            return
+        try:
+            self.configure(bg=mix(start, end, step / self.ANIM_STEPS))
+        except tk.TclError:      # widget destroyed mid-animation
+            return
+        self._anim = self.after(self.ANIM_MS, self._ease, start, end, step + 1)
+
+
+def make_card(parent, title):
+    """
+    A white panel with a section title and the gold hairline under it.
+    Returns the body frame to put content in.
+    """
+    outer = tk.Frame(parent, bg=PALETTE["card"], highlightthickness=1,
+                     highlightbackground=PALETTE["border"],
+                     highlightcolor=PALETTE["border"])
+    outer.pack(fill=tk.X, pady=(0, 10))
+
+    head = tk.Frame(outer, bg=PALETTE["card"])
+    head.pack(fill=tk.X, padx=12, pady=(10, 0))
+    tk.Label(head, text=title.upper(), bg=PALETTE["card"],
+             fg=PALETTE["header"], font=FONT_CARD).pack(anchor="w")
+    tk.Frame(head, bg=PALETTE["gold"], height=2, width=34).pack(anchor="w", pady=(3, 0))
+
+    body = tk.Frame(outer, bg=PALETTE["card"])
+    body.pack(fill=tk.X, padx=12, pady=(8, 12))
+    return body
+
+
+def field_label(parent, text):
+    return tk.Label(parent, text=text.upper(), bg=PALETTE["card"],
+                    fg=PALETTE["muted"], font=FONT_LABEL)
+
+
 class CalendarPopup(tk.Toplevel):
     """
     A month-grid date picker for the scan range fields.
@@ -107,23 +287,28 @@ class CalendarPopup(tk.Toplevel):
         self.year, self.month = selected.year, selected.month
         self.selected = selected
 
-        header = ttk.Frame(self, padding=(6, 6, 6, 0))
-        header.pack(fill=tk.X)
-        ttk.Button(header, text="‹", width=3,
-                   command=lambda: self.shift_month(-1)).pack(side=tk.LEFT)
-        self.header_label = ttk.Label(header, anchor="center",
-                                      font=("Arial", 10, "bold"), width=18)
-        self.header_label.pack(side=tk.LEFT, expand=True)
-        ttk.Button(header, text="›", width=3,
-                   command=lambda: self.shift_month(1)).pack(side=tk.LEFT)
+        self.configure(bg=PALETTE["card"])
 
-        self.grid_frame = ttk.Frame(self, padding=6)
+        header = tk.Frame(self, bg=PALETTE["header"])
+        header.pack(fill=tk.X)
+        ActionButton(header, "‹", command=lambda: self.shift_month(-1),
+                     kind="primary", padx=10, pady=3).pack(side=tk.LEFT, padx=8, pady=8)
+        self.header_label = tk.Label(header, anchor="center", width=18,
+                                     bg=PALETTE["header"], fg="#ffffff",
+                                     font=("Segoe UI", 10, "bold"))
+        self.header_label.pack(side=tk.LEFT, expand=True)
+        ActionButton(header, "›", command=lambda: self.shift_month(1),
+                     kind="primary", padx=10, pady=3).pack(side=tk.LEFT, padx=8, pady=8)
+
+        self.grid_frame = tk.Frame(self, bg=PALETTE["card"], padx=8, pady=8)
         self.grid_frame.pack()
 
-        footer = ttk.Frame(self, padding=(6, 0, 6, 6))
-        footer.pack(fill=tk.X)
-        ttk.Button(footer, text="Today", command=self.pick_today).pack(side=tk.LEFT)
-        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        footer = tk.Frame(self, bg=PALETTE["card"])
+        footer.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ActionButton(footer, "Today", command=self.pick_today,
+                     kind="ghost", padx=10, pady=4).pack(side=tk.LEFT)
+        ActionButton(footer, "Cancel", command=self.destroy,
+                     kind="ghost", padx=10, pady=4).pack(side=tk.RIGHT)
 
         self.draw()
         self.update_idletasks()
@@ -150,8 +335,10 @@ class CalendarPopup(tk.Toplevel):
 
         self.header_label.config(text=f"{calendar.month_name[self.month]} {self.year}")
         for col, name in enumerate(self.DAY_HEADS):
-            ttk.Label(self.grid_frame, text=name, width=4, anchor="center",
-                      font=("Arial", 8, "bold")).grid(row=0, column=col, padx=1, pady=(0, 2))
+            tk.Label(self.grid_frame, text=name, width=4, anchor="center",
+                     bg=PALETTE["card"],
+                     fg=PALETTE["accent"] if col >= 5 else PALETTE["muted"],
+                     font=FONT_LABEL).grid(row=0, column=col, padx=1, pady=(0, 4))
 
         today = datetime.now().date()
         for r, week in enumerate(calendar.Calendar(firstweekday=0).monthdayscalendar(
@@ -160,14 +347,14 @@ class CalendarPopup(tk.Toplevel):
                 if day == 0:
                     continue
                 when = datetime(self.year, self.month, day)
-                style = "TButton"
-                if when.date() == today:
-                    style = "Today.TButton"
+                kind = "ghost"
                 if when.date() == self.selected.date():
-                    style = "Selected.TButton"
-                ttk.Button(self.grid_frame, text=str(day), width=4, style=style,
-                           command=lambda w=when: self.choose(w)).grid(
-                    row=r, column=c, padx=1, pady=1)
+                    kind = "primary"
+                elif when.date() == today:
+                    kind = "gold"
+                ActionButton(self.grid_frame, str(day), kind=kind,
+                             command=lambda w=when: self.choose(w),
+                             width=2, padx=4, pady=3).grid(row=r, column=c, padx=1, pady=1)
 
 
 class WebDriverProxy:
@@ -192,45 +379,141 @@ class App(tk.Tk):
         super().__init__()
         self.title("GVC Appointment Scanner")
         self.geometry("1000x750")
-        self.configure(padx=10, pady=10)
-        
+        self.configure(bg=PALETTE["page"])
+
         self._thread = None
         self._stop = threading.Event()
         self._continue = threading.Event()
         self._driver = None
         self._hwnd = None
         self._lock = threading.Lock()
-        
-        style = ttk.Style(self)
-        style.configure("Today.TButton", foreground="#0a58ca", font=("Arial", 9, "bold"))
-        style.configure("Selected.TButton", foreground="#ffffff", background="#0a58ca")
-        style.map("Selected.TButton", background=[("active", "#0a58ca")])
+        self._pulse = None
 
+        self.apply_theme()
         self.build_ui()
         self.load_settings()
 
-    def build_ui(self):
-        # Top Header
-        header = ttk.Label(self, text="GVC Appointment Scanner", font=("Arial", 16, "bold"))
-        header.pack(side=tk.TOP, pady=(0, 10))
+    def apply_theme(self):
+        """
+        Paints ttk to match the palette.
 
-        # Main PanedWindow for resizable split
-        self.paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        'clam' is the only bundled theme that lets colours through — the default
+        Windows theme delegates to the native renderer and silently ignores most
+        of what is configured below.
+        """
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure("TFrame", background=PALETTE["card"])
+        style.configure("Page.TFrame", background=PALETTE["page"])
+        style.configure("TPanedwindow", background=PALETTE["page"])
+        style.configure("TLabel", background=PALETTE["card"],
+                        foreground=PALETTE["text"], font=FONT_UI)
+
+        style.configure("Field.TEntry", fieldbackground="#ffffff",
+                        background="#ffffff", foreground=PALETTE["text"],
+                        insertcolor=PALETTE["text"], padding=(6, 5),
+                        bordercolor=PALETTE["field"], lightcolor=PALETTE["field"],
+                        darkcolor=PALETTE["field"], borderwidth=1)
+        for prop in ("bordercolor", "lightcolor", "darkcolor"):
+            style.map("Field.TEntry", **{prop: [("focus", PALETTE["primary"])]})
+
+        style.configure("Field.TCombobox", fieldbackground="#ffffff",
+                        background="#ffffff", foreground=PALETTE["text"],
+                        arrowcolor=PALETTE["primary"], padding=(5, 4),
+                        bordercolor=PALETTE["field"], lightcolor=PALETTE["field"],
+                        darkcolor=PALETTE["field"], borderwidth=1)
+        style.map("Field.TCombobox",
+                  fieldbackground=[("readonly", "#ffffff")],
+                  selectbackground=[("readonly", "#ffffff")],
+                  selectforeground=[("readonly", PALETTE["text"])],
+                  bordercolor=[("focus", PALETTE["primary"])])
+        # the popdown list is a classic Tk listbox, styled through the option db
+        self.option_add("*TCombobox*Listbox.background", "#ffffff")
+        self.option_add("*TCombobox*Listbox.foreground", PALETTE["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", PALETTE["primary"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.font", FONT_UI)
+
+        style.configure("Card.TCheckbutton", background=PALETTE["card"],
+                        foreground=PALETTE["text"], font=FONT_UI,
+                        focuscolor=PALETTE["card"])
+        style.map("Card.TCheckbutton",
+                  background=[("active", PALETTE["card"])],
+                  indicatorcolor=[("selected", PALETTE["primary"]),
+                                  ("!selected", "#ffffff")])
+
+        style.configure("Vertical.TScrollbar", background=PALETTE["border"],
+                        troughcolor=PALETTE["page"], bordercolor=PALETTE["page"],
+                        arrowcolor=PALETTE["muted"], relief="flat")
+        style.map("Vertical.TScrollbar",
+                  background=[("active", PALETTE["muted"])])
+
+    # ---------------------------------------------------------------- layout
+    def build_ui(self):
+        self.build_header()
+
+        body = tk.Frame(self, bg=PALETTE["page"])
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        self.paned = ttk.PanedWindow(body, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True)
 
-        # Left Panel (Settings). Scrollable: the per-type weekday rows push the
-        # settings past the window height on a 720p screen, and without this the
-        # Start button ends up below the bottom edge.
-        left_outer = ttk.Frame(self.paned, relief="solid", borderwidth=1)
+        left_frame = self.build_settings_pane()
+        self.build_activity_pane()
+
+        self.build_account_card(left_frame)
+        self.build_applicant_card(left_frame)
+        self.build_search_card(left_frame)
+        self.build_action_bar(left_frame)
+
+    def build_header(self):
+        """Navy title bar with the live status pill on the right."""
+        bar = tk.Frame(self, bg=PALETTE["header"])
+        bar.pack(fill=tk.X, side=tk.TOP)
+
+        left = tk.Frame(bar, bg=PALETTE["header"])
+        left.pack(side=tk.LEFT, padx=16, pady=10)
+        tk.Label(left, text="✈  GVC Appointment Scanner", bg=PALETTE["header"],
+                 fg="#ffffff", font=FONT_TITLE).pack(anchor="w")
+        tk.Label(left, text="Visa appointment availability monitor",
+                 bg=PALETTE["header"], fg=PALETTE["header_dim"],
+                 font=FONT_SMALL).pack(anchor="w")
+
+        right = tk.Frame(bar, bg=PALETTE["header"])
+        right.pack(side=tk.RIGHT, padx=16)
+        self.status_dot = tk.Canvas(right, width=12, height=12, bg=PALETTE["header"],
+                                    highlightthickness=0)
+        self.status_dot.pack(side=tk.LEFT, pady=2)
+        self._dot = self.status_dot.create_oval(2, 2, 10, 10, fill=PALETTE["header_dim"],
+                                                outline="")
+        self.status_label = tk.Label(right, text="Status: Idle", bg=PALETTE["header"],
+                                     fg="#ffffff", font=FONT_CARD,
+                                     wraplength=360, justify="left")
+        self.status_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Frame(self, bg=PALETTE["gold"], height=3).pack(fill=tk.X, side=tk.TOP)
+
+    def build_settings_pane(self):
+        """
+        The scrolling column of cards on the left.
+
+        Scrollable because the per-type weekday rows push the settings past the
+        window height on a 720p screen; without it the Start button ends up
+        below the bottom edge.
+        """
+        left_outer = tk.Frame(self.paned, bg=PALETTE["page"])
         self.paned.add(left_outer, weight=1)
 
-        left_canvas = tk.Canvas(left_outer, highlightthickness=0, borderwidth=0, width=360)
-        left_scroll = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+        left_canvas = tk.Canvas(left_outer, highlightthickness=0, borderwidth=0,
+                                width=392, bg=PALETTE["page"])
+        left_scroll = ttk.Scrollbar(left_outer, orient="vertical",
+                                    command=left_canvas.yview)
         left_canvas.configure(yscrollcommand=left_scroll.set)
         left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        left_frame = ttk.Frame(left_canvas, padding=10)
+        left_frame = tk.Frame(left_canvas, bg=PALETTE["page"], padx=12, pady=12)
         left_window = left_canvas.create_window((0, 0), window=left_frame, anchor="nw")
 
         def _sync_left_scroll(_event=None):
@@ -243,138 +526,170 @@ class App(tk.Tk):
         left_canvas.bind("<Configure>", _sync_left_scroll)
 
         # Wheel is bound only while the pointer is over this panel, so it does
-        # not steal scrolling from the console output on the right.
+        # not steal scrolling from the activity log on the right.
         def _on_wheel(event):
             left_canvas.yview_scroll(int(-event.delta / 120), "units")
 
         left_canvas.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", _on_wheel))
         left_canvas.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+        return left_frame
 
+    def build_activity_pane(self):
+        right_outer = tk.Frame(self.paned, bg=PALETTE["page"], padx=12, pady=12)
+        self.paned.add(right_outer, weight=2)
 
-        # Right Panel (Logs)
-        right_frame = ttk.Frame(self.paned, padding=10, relief="solid", borderwidth=1)
-        self.paned.add(right_frame, weight=3)
-        
-        row = 0
-        
-        # Row 0
-        ttk.Label(left_frame, text="Username:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="Password:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
+        card = tk.Frame(right_outer, bg=PALETTE["card"], highlightthickness=1,
+                        highlightbackground=PALETTE["border"])
+        card.pack(fill=tk.BOTH, expand=True)
+
+        head = tk.Frame(card, bg=PALETTE["card"])
+        head.pack(fill=tk.X, padx=12, pady=(10, 0))
+        tk.Label(head, text="ACTIVITY", bg=PALETTE["card"], fg=PALETTE["header"],
+                 font=FONT_CARD).pack(anchor="w")
+        tk.Frame(head, bg=PALETTE["gold"], height=2, width=34).pack(anchor="w", pady=(3, 0))
+
+        self.log_area = scrolledtext.ScrolledText(
+            card, wrap=tk.WORD, state="disabled", font=FONT_LOG,
+            bg="#fbfcfe", fg=PALETTE["text"], relief="flat", borderwidth=0,
+            padx=10, pady=8, insertbackground=PALETTE["text"],
+            selectbackground=PALETTE["primary"], selectforeground="#ffffff")
+        self.log_area.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # One tag per severity, so the log is scannable at a glance instead of
+        # being a wall of identical grey text.
+        for tag, colour, font in (
+                ("info",  PALETTE["text"],   FONT_LOG),
+                ("muted", PALETTE["muted"],  FONT_LOG),
+                ("head",  PALETTE["primary"], ("Consolas", 9, "bold")),
+                ("ok",    PALETTE["ok"],     ("Consolas", 9, "bold")),
+                ("warn",  PALETTE["warn"],   FONT_LOG),
+                ("err",   PALETTE["accent"], ("Consolas", 9, "bold"))):
+            self.log_area.tag_configure(tag, foreground=colour, font=font)
+
+    def build_account_card(self, parent):
+        card = make_card(parent, "Account")
+        card.columnconfigure(0, weight=1, uniform="f")
+        card.columnconfigure(1, weight=1, uniform="f")
+
         self.username_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.username_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
+        self._entry(card, 0, 0, "Username", self.username_var)
         self.password_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.password_var, show="*", width=22).grid(row=row, column=1, pady=2, padx=2, sticky="w")
-        row += 1
-        # Row 1
-        ttk.Label(left_frame, text="First Name:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="Surname:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
-        self.first_name_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.first_name_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
-        self.surname_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.surname_var, width=22).grid(row=row, column=1, pady=2, padx=2, sticky="w")
-        row += 1
-        
-        # Row 2
-        ttk.Label(left_frame, text="DOB (dd/mm/yyyy):", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="Passport Number:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
-        self.dob_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.dob_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
-        self.passport_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.passport_var, width=22).grid(row=row, column=1, pady=2, padx=2, sticky="w")
-        row += 1
-        
-        # Row 2
-        ttk.Label(left_frame, text="Passport Expiry:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="Gender:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
-        self.expiry_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.expiry_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
-        self.gender_var = tk.StringVar()
-        gender_cb = ttk.Combobox(left_frame, textvariable=self.gender_var, values=[g["label"] for g in GENDER_CHOICES], state="readonly", width=19)
-        gender_cb.grid(row=row, column=1, pady=2, padx=2, sticky="w")
-        row += 1
-        
-        # Row 3
-        ttk.Label(left_frame, text="Nationality:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="City (VAC):", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
-        self.nationality_var = tk.StringVar()
-        ttk.Entry(left_frame, textvariable=self.nationality_var, width=22).grid(row=row, column=0, pady=2, padx=2, sticky="w")
-        self.city_var = tk.StringVar(value="islamabad")
-        city_cb = ttk.Combobox(left_frame, textvariable=self.city_var, values=["islamabad", "lahore"], state="readonly", width=19)
-        city_cb.grid(row=row, column=1, pady=2, padx=2, sticky="w")
-        self.city_var.trace_add("write", self.update_appointment_types_ui)
-        row += 1
-        
-        # Row 4
-        ttk.Label(left_frame, text="Scan Start Date:", font=("Arial", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(5, 2), padx=2)
-        ttk.Label(left_frame, text="Scan End Date:", font=("Arial", 9, "bold")).grid(row=row, column=1, sticky="w", pady=(5, 2), padx=2)
-        row += 1
-        self.start_date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
-        self._date_field(left_frame, row, 0, self.start_date_var)
-        self.end_date_var = tk.StringVar(value=(datetime.now() + timedelta(days=4)).strftime("%d/%m/%Y"))
-        self._date_field(left_frame, row, 1, self.end_date_var)
-        row += 1
+        self._entry(card, 0, 1, "Password", self.password_var, show="*")
 
-        self.range_label = ttk.Label(left_frame, text="", foreground="gray", font=("Arial", 8))
-        self.range_label.grid(row=row, column=0, columnspan=2, sticky="w", padx=2)
-        self.start_date_var.trace_add("write", self.update_range_label)
-        self.end_date_var.trace_add("write", self.update_range_label)
-        self.start_date_var.trace_add("write", self.update_type_day_counts)
-        self.end_date_var.trace_add("write", self.update_type_day_counts)
+    def build_applicant_card(self, parent):
+        card = make_card(parent, "Applicant")
+        card.columnconfigure(0, weight=1, uniform="f")
+        card.columnconfigure(1, weight=1, uniform="f")
+
+        self.first_name_var = tk.StringVar()
+        self._entry(card, 0, 0, "First name", self.first_name_var)
+        self.surname_var = tk.StringVar()
+        self._entry(card, 0, 1, "Surname", self.surname_var)
+
+        self.dob_var = tk.StringVar()
+        self._entry(card, 2, 0, "Date of birth", self.dob_var)
+        self.passport_var = tk.StringVar()
+        self._entry(card, 2, 1, "Passport number", self.passport_var)
+
+        self.expiry_var = tk.StringVar()
+        self._entry(card, 4, 0, "Passport expiry", self.expiry_var)
+        self.gender_var = tk.StringVar()
+        self._combo(card, 4, 1, "Gender", self.gender_var,
+                    [g["label"] for g in GENDER_CHOICES])
+
+        self.nationality_var = tk.StringVar()
+        self._entry(card, 6, 0, "Nationality", self.nationality_var)
+        self.city_var = tk.StringVar(value="islamabad")
+        self._combo(card, 6, 1, "City (VAC)", self.city_var, ["islamabad", "lahore"])
+        self.city_var.trace_add("write", self.update_appointment_types_ui)
+
+    def build_search_card(self, parent):
+        card = make_card(parent, "Search window")
+        card.columnconfigure(0, weight=1, uniform="f")
+        card.columnconfigure(1, weight=1, uniform="f")
+
+        self.start_date_var = tk.StringVar(value=datetime.now().strftime("%d/%m/%Y"))
+        self._date_field(card, 0, 0, self.start_date_var, "From")
+        self.end_date_var = tk.StringVar(
+            value=(datetime.now() + timedelta(days=4)).strftime("%d/%m/%Y"))
+        self._date_field(card, 0, 1, self.end_date_var, "To")
+
+        self.range_label = tk.Label(card, text="", bg=PALETTE["card"],
+                                    fg=PALETTE["muted"], font=FONT_SMALL)
+        self.range_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        for var in (self.start_date_var, self.end_date_var):
+            var.trace_add("write", self.update_range_label)
+            var.trace_add("write", self.update_type_day_counts)
         self.update_range_label()
-        row += 1
-        
-        # Appointment Types (span across)
-        ttk.Label(left_frame, text="Appointment Types:", font=("Arial", 9, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2), padx=2); row+=1
-        
-        self.types_frame = ttk.Frame(left_frame)
-        self.types_frame.grid(row=row, column=0, columnspan=2, sticky="w")
-        row+=1
-        
+
+        tk.Frame(card, bg=PALETTE["border"], height=1).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=10)
+
+        tk.Label(card, text="APPOINTMENT TYPES", bg=PALETTE["card"],
+                 fg=PALETTE["muted"], font=FONT_LABEL).grid(
+            row=4, column=0, columnspan=2, sticky="w")
+        tk.Label(card, text="Untick a weekday to skip it for that type.",
+                 bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(1, 6))
+
+        self.types_frame = tk.Frame(card, bg=PALETTE["card"])
+        self.types_frame.grid(row=6, column=0, columnspan=2, sticky="ew")
+
         self.type_vars = {}
         self.weekday_vars = {}
         self.day_count_labels = {}
         self.current_appointment_choices = []
 
-        ttk.Separator(left_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky="ew", pady=15); row+=1
-        
-        # Buttons
-        buttons_frame = ttk.Frame(left_frame)
-        buttons_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=2)
-        buttons_frame.columnconfigure(0, weight=1)
-        buttons_frame.columnconfigure(1, weight=1)
-        
-        self.start_btn = ttk.Button(buttons_frame, text="▶ Start Scanning", command=self.start_scan)
-        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2))
-        
-        self.stop_btn = ttk.Button(buttons_frame, text="⏹ Stop", command=self.stop_scan, state="disabled")
-        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
-        
-        row += 1
-        
-        ttk.Separator(left_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky="ew", pady=15); row+=1
-        
-        self.confirm_btn = ttk.Button(left_frame, text="🔓 Confirm Manual Action", command=self.confirm_gate, state="disabled")
-        self.confirm_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2, padx=2, ipady=5); row+=1
-        
-        self.status_label = ttk.Label(left_frame, text="Status: Idle", foreground="blue", wraplength=280, font=("Arial", 10, "bold"))
-        self.status_label.grid(row=row, column=0, columnspan=2, sticky="w", pady=15, padx=2); row+=1
+    def build_action_bar(self, parent):
+        bar = tk.Frame(parent, bg=PALETTE["page"])
+        bar.pack(fill=tk.X, pady=(2, 0))
+        bar.columnconfigure(0, weight=3, uniform="b")
+        bar.columnconfigure(1, weight=2, uniform="b")
 
-        ttk.Label(right_frame, text="Console Output", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
-        self.log_area = scrolledtext.ScrolledText(right_frame, wrap=tk.WORD, state="disabled", font=("Consolas", 10), bg="#1e1e1e", fg="#cccccc")
-        self.log_area.pack(fill=tk.BOTH, expand=True)
+        self.start_btn = ActionButton(bar, "▶  Start Scanning",
+                                      command=self.start_scan, kind="primary")
+        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
-    def _date_field(self, parent, row, column, var):
+        self.stop_btn = ActionButton(bar, "⏹  Stop", command=self.stop_scan,
+                                     kind="danger", state="disabled")
+        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self.confirm_btn = ActionButton(bar, "🔓  Confirm Manual Action",
+                                        command=self.confirm_gate, kind="gold",
+                                        state="disabled")
+        self.confirm_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    # ------------------------------------------------------------ field parts
+    def _entry(self, parent, row, column, label, var, **kw):
+        field_label(parent, label).grid(row=row, column=column, sticky="w",
+                                        padx=(0, 6) if column == 0 else (6, 0))
+        entry = ttk.Entry(parent, textvariable=var, style="Field.TEntry",
+                          font=FONT_UI, **kw)
+        entry.grid(row=row + 1, column=column, sticky="ew", pady=(2, 8),
+                   padx=(0, 6) if column == 0 else (6, 0))
+        return entry
+
+    def _combo(self, parent, row, column, label, var, values):
+        field_label(parent, label).grid(row=row, column=column, sticky="w",
+                                        padx=(0, 6) if column == 0 else (6, 0))
+        combo = ttk.Combobox(parent, textvariable=var, values=values,
+                             state="readonly", style="Field.TCombobox", font=FONT_UI)
+        combo.grid(row=row + 1, column=column, sticky="ew", pady=(2, 8),
+                   padx=(0, 6) if column == 0 else (6, 0))
+        return combo
+
+    def _date_field(self, parent, row, column, var, label="Date"):
         """A date entry paired with a button that opens the calendar picker."""
-        holder = ttk.Frame(parent)
-        holder.grid(row=row, column=column, pady=2, padx=2, sticky="w")
-        ttk.Entry(holder, textvariable=var, width=16).pack(side=tk.LEFT)
-        ttk.Button(holder, text="📅", width=3,
-                   command=lambda: CalendarPopup(self, var)).pack(side=tk.LEFT, padx=(2, 0))
+        field_label(parent, label).grid(row=row, column=column, sticky="w",
+                                        padx=(0, 6) if column == 0 else (6, 0))
+        holder = tk.Frame(parent, bg=PALETTE["card"])
+        holder.grid(row=row + 1, column=column, sticky="ew", pady=(2, 0),
+                    padx=(0, 6) if column == 0 else (6, 0))
+        ttk.Entry(holder, textvariable=var, style="Field.TEntry",
+                  font=FONT_UI, width=11).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ActionButton(holder, "📅", kind="ghost", padx=7, pady=3,
+                     command=lambda: CalendarPopup(self, var)).pack(side=tk.LEFT, padx=(4, 0))
 
     def update_range_label(self, *args):
         """Shows how many days the chosen range covers, so an over-long scan is
@@ -383,16 +698,17 @@ class App(tk.Tk):
             start = datetime.strptime(normalize_date(self.start_date_var.get(), "start"), "%d/%m/%Y")
             end = datetime.strptime(normalize_date(self.end_date_var.get(), "end"), "%d/%m/%Y")
         except Exception:
-            self.range_label.config(text="", foreground="gray")
+            self.range_label.config(text="", foreground=PALETTE["muted"])
             return
 
         days = (end - start).days + 1
         if days < 1:
-            self.range_label.config(text="End date is before start date", foreground="red")
+            self.range_label.config(text="⚠  End date is before start date",
+                                    foreground=PALETTE["accent"])
         else:
             self.range_label.config(
                 text=f"{days} day{'s' if days != 1 else ''} per appointment type",
-                foreground="gray" if days <= 30 else "#b06000")
+                foreground=PALETTE["muted"] if days <= 30 else PALETTE["warn"])
 
     def update_appointment_types_ui(self, *args):
         # This runs again on every city switch and destroys the old widgets, so
@@ -413,33 +729,61 @@ class App(tk.Tk):
         self.day_count_labels = {}
         for r, t in enumerate(self.current_appointment_choices):
             value = t["value"]
-            block = ttk.Frame(self.types_frame)
-            block.grid(row=r, column=0, sticky="w", pady=(0, 5))
+            block = tk.Frame(self.types_frame, bg=PALETTE["card"])
+            block.grid(row=r, column=0, sticky="ew", pady=(0, 8))
 
             var = tk.BooleanVar(value=True)
             self.type_vars[value] = var
-            ttk.Checkbutton(block, text=t["label"], variable=var).grid(
-                row=0, column=0, sticky="w", padx=10)
+            # tk, not ttk: the clam theme draws its checked indicator as a cross,
+            # which reads as "excluded" on a list of things you are opting into.
+            tk.Checkbutton(block, text=t["label"], variable=var,
+                           bg=PALETTE["card"], fg=PALETTE["text"], font=FONT_UI,
+                           activebackground=PALETTE["card"],
+                           activeforeground=PALETTE["primary"],
+                           selectcolor="#ffffff", anchor="w", bd=0,
+                           highlightthickness=0, padx=0, cursor="hand2"
+                           ).grid(row=0, column=0, sticky="w")
 
             # Plain tk.Checkbutton, not ttk: indicatoron=0 turns it into a toggle
-            # that visibly stays pressed and honours selectcolor. ttk has no
-            # equivalent without defining a custom theme element.
-            day_row = ttk.Frame(block)
-            day_row.grid(row=1, column=0, sticky="w", padx=(28, 0))
+            # button, and only the tk widget lets us repaint it per state. ttk
+            # has no equivalent without defining a custom theme element.
+            day_row = tk.Frame(block, bg=PALETTE["card"])
+            day_row.grid(row=1, column=0, sticky="w", padx=(20, 0), pady=(4, 0))
             saved = previous.get(value, [True] * 7)
             bits = []
             for i, name in enumerate(self.DAY_TOGGLE_LABELS):
                 bit = tk.BooleanVar(value=saved[i])
                 bits.append(bit)
-                tk.Checkbutton(day_row, text=name, variable=bit, indicatoron=0,
-                               width=2, font=("Arial", 8), selectcolor="#9ec5fe",
-                               command=self.update_type_day_counts).pack(side=tk.LEFT, padx=1)
+                toggle = tk.Checkbutton(
+                    day_row, text=name, variable=bit, indicatoron=0, width=2,
+                    font=FONT_LABEL, relief="flat", bd=0, highlightthickness=1,
+                    highlightbackground=PALETTE["border"], cursor="hand2",
+                    takefocus=0)
+                toggle.configure(command=lambda b=bit, w=toggle: self._toggle_day(b, w))
+                self._paint_day_toggle(bit, toggle)
+                toggle.pack(side=tk.LEFT, padx=1)
             self.weekday_vars[value] = bits
 
-            count = ttk.Label(day_row, text="", foreground="gray", font=("Arial", 8))
-            count.pack(side=tk.LEFT, padx=(6, 0))
+            count = tk.Label(day_row, text="", bg=PALETTE["card"],
+                             fg=PALETTE["muted"], font=FONT_SMALL)
+            count.pack(side=tk.LEFT, padx=(8, 0))
             self.day_count_labels[value] = count
 
+        self.update_type_day_counts()
+
+    def _paint_day_toggle(self, bit, widget):
+        """Selected weekdays are filled navy; skipped ones sit back in grey."""
+        on = bit.get()
+        widget.configure(
+            bg=PALETTE["primary"] if on else PALETTE["sunken"],
+            fg="#ffffff" if on else PALETTE["muted"],
+            selectcolor=PALETTE["primary"] if on else PALETTE["sunken"],
+            activebackground=PALETTE["primary_hi"] if on else PALETTE["hover"],
+            activeforeground="#ffffff" if on else PALETTE["text"],
+            highlightbackground=PALETTE["primary"] if on else PALETTE["border"])
+
+    def _toggle_day(self, bit, widget):
+        self._paint_day_toggle(bit, widget)
         self.update_type_day_counts()
 
     def update_type_day_counts(self, *args):
@@ -456,18 +800,18 @@ class App(tk.Tk):
 
         for value, label in self.day_count_labels.items():
             if total < 1:
-                label.config(text="", foreground="gray")
+                label.config(text="", fg=PALETTE["muted"])
                 continue
 
             picked = {i for i, bit in enumerate(self.weekday_vars[value]) if bit.get()}
             if len(picked) >= 7:
-                label.config(text=f"{total} days", foreground="gray")
+                label.config(text=f"{total} days", fg=PALETTE["muted"])
                 continue
 
             matching = sum(1 for offset in range(total)
                            if (start + timedelta(days=offset)).weekday() in picked)
             label.config(text=f"{matching} of {total} days",
-                         foreground="red" if matching == 0 else "gray")
+                         fg=PALETTE["accent"] if matching == 0 else PALETTE["muted"])
 
     def load_settings(self):
         if not CONFIG_FILE.exists():
@@ -545,11 +889,62 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    LOG_TAGS = (
+        ("ok",    ("✅", "SLOTS AVAILABLE", "OTP REQUESTED", "🟢", "📲", "successfully")),
+        ("err",   ("❌", "FATAL", "Traceback", "Error:", "ERROR", "failed", "Failed")),
+        ("warn",  ("⚠",)),
+        ("head",  ("[STEP]", "[SCANNING]", "[GATE]", "══", "SCAN ROUND")),
+        ("muted", ("✗",)),
+    )
+
+    @classmethod
+    def log_tag(cls, msg: str) -> str:
+        """Severity of a log line, so the activity panel is scannable."""
+        for tag, markers in cls.LOG_TAGS:
+            if any(marker in msg for marker in markers):
+                return tag
+        return "info"
+
     def log(self, msg):
         self.log_area.config(state="normal")
-        self.log_area.insert(tk.END, msg + "\n")
+        self.log_area.insert(tk.END, msg + "\n", self.log_tag(msg))
         self.log_area.see(tk.END)
         self.log_area.config(state="disabled")
+
+    # --------------------------------------------------------------- status
+    STATUS_COLOURS = {
+        "idle":    PALETTE["header_dim"],
+        "busy":    PALETTE["gold"],
+        "waiting": PALETTE["gold"],
+        "running": "#4ade80",
+        "stopped": PALETTE["header_dim"],
+        "error":   PALETTE["accent"],
+    }
+
+    def set_status(self, text, kind="idle"):
+        """Updates the header pill. 'running' and 'waiting' pulse the dot."""
+        self.status_label.config(text=f"Status: {text}")
+        colour = self.STATUS_COLOURS.get(kind, PALETTE["header_dim"])
+        self.status_dot.itemconfigure(self._dot, fill=colour)
+
+        if self._pulse is not None:
+            try:
+                self.after_cancel(self._pulse)
+            except Exception:
+                pass
+            self._pulse = None
+        if kind in ("running", "waiting"):
+            self._pulse_dot(colour, 0)
+
+    def _pulse_dot(self, colour, step):
+        """Breathes the status dot between its colour and the bar behind it."""
+        t = abs((step % 20) - 10) / 10.0
+        try:
+            self.status_dot.itemconfigure(
+                self._dot, fill=mix(colour, PALETTE["header"], t * 0.55))
+        except tk.TclError:
+            return
+        self._pulse = self.after(70, self._pulse_dot, colour, step + 1)
 
     def _track_driver(self, driver):
         with self._lock:
@@ -678,7 +1073,7 @@ class App(tk.Tk):
         
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status_label.config(text="Status: Starting...", foreground="blue")
+        self.set_status("Starting…", "busy")
         
         self._stop.clear()
         self._continue.clear()
@@ -705,10 +1100,8 @@ class App(tk.Tk):
             
             def enable_confirm():
                 self.confirm_btn.config(state="normal")
-                self.status_label.config(
-                    text="Status: Waiting for you to confirm login/booking in Chrome",
-                    foreground="orange"
-                )
+                self.set_status("Waiting for you to confirm login/booking in Chrome",
+                                "waiting")
             
             self.after(0, enable_confirm)
             
@@ -730,7 +1123,7 @@ class App(tk.Tk):
 
             def disable_confirm():
                 self.confirm_btn.config(state="disabled")
-                self.status_label.config(text="Status: Running", foreground="green")
+                self.set_status("Running", "running")
                 
             self.after(0, disable_confirm)
             self.after(0, self.log, "[GATE] Continue received - resuming automation.")
@@ -761,7 +1154,7 @@ class App(tk.Tk):
             bot.input = patched_input
             bot.webdriver = WebDriverProxy(original_webdriver, self._track_driver)
 
-            self.after(0, lambda: self.status_label.config(text="Status: Running", foreground="green"))
+            self.after(0, lambda: self.set_status("Running", "running"))
             bot.main()
             
         except KeyboardInterrupt:
@@ -797,13 +1190,13 @@ class App(tk.Tk):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.confirm_btn.config(state="disabled")
-        self.status_label.config(text="Status: Stopped", foreground="black")
+        self.set_status("Stopped", "stopped")
 
     def stop_scan(self):
         self._stop.set()
         self._continue.set()
         self.log("Stop requested... winding down.")
-        self.status_label.config(text="Status: Stopping...", foreground="red")
+        self.set_status("Stopping…", "busy")
 
     def confirm_gate(self):
         self._continue.set()

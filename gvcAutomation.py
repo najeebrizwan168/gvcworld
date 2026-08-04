@@ -75,6 +75,57 @@ SEARCH_RESULT_WAIT_SECONDS = 3
 # looking while it finishes rendering. Polled, so this is a ceiling too.
 PANEL_STABILIZE_SECONDS = 5
 
+# Reload the appointment form after this many complete scan rounds. The page can
+# lose its connection to the portal and keep answering searches from a stale
+# client-side state — indistinguishable from "no appointments available" — so it
+# is refreshed on a schedule rather than trusted indefinitely.
+REFRESH_EVERY_N_ROUNDS = 3
+
+# Upper bound on the wait when the page still has a request in flight. The 3s
+# ceiling above is for deciding "nothing is coming"; if the network probe says
+# the portal simply hasn't answered yet, cutting it off at 3s would manufacture
+# the false "no slots" this is meant to prevent.
+SEARCH_RESULT_EXTENDED_SECONDS = 15
+
+# How long to confirm that clicking Search actually put a request on the wire.
+CLICK_DISPATCH_CONFIRM_SECONDS = 0.6
+
+# Consecutive searches with no server response before the page is treated as
+# stalled and reloaded in place.
+STALL_TIMEOUT_THRESHOLD = 3
+
+# Wait before each successive in-place recovery. The first is immediate; if the
+# stall survives a reload the portal is likely throttling us, and reloading
+# harder would only raise our profile — so back off instead. Seconds.
+STALL_BACKOFF_SECONDS = (0, 60, 180, 300)
+
+# Consecutive no-response searches, and how many recoveries we have done without
+# a genuine server response in between. Both reset the moment a search answers.
+_consecutive_timeouts = 0
+_stall_recoveries = 0
+
+# The portal (Cloudflare in front of it) answers with this when we have asked
+# too often. It is a refusal to answer, NOT an answer of "no appointments".
+RATE_LIMITED_STATUS = 429
+
+# Minimum gap between two searches. Self-tuning: it widens when the portal
+# pushes back and drifts down again once it stops, so we find the fastest pace
+# the portal will actually tolerate instead of guessing one. Seconds.
+SEARCH_MIN_INTERVAL_SECONDS = 4.0
+SEARCH_MAX_INTERVAL_SECONDS = 20.0
+SEARCH_INTERVAL_GROWTH = 1.5
+SEARCH_INTERVAL_DECAY = 0.9
+CLEAN_SEARCHES_BEFORE_SPEEDUP = 10
+
+# How long to send nothing at all once rate-limited. Measured, not guessed: in
+# the 04/08 trace pausing 60s and 180s did not clear the limit, 300s did.
+RATE_LIMIT_COOLDOWN_SECONDS = (300, 600, 900)
+
+_search_interval = SEARCH_MIN_INTERVAL_SECONDS
+_last_search_at = 0.0
+_clean_searches = 0
+_rate_limit_cooldowns = 0
+
 # Flat settle after the manual login gate, before touching the dashboard.
 DASHBOARD_STABILIZE_SECONDS = 5
 
@@ -99,6 +150,95 @@ def debug(msg: str):
         # Legacy console codepage (cp1252) can't render the status glyphs —
         # degrade the line rather than killing the scan over a log message
         print(f"  [{ts}] {msg.encode('ascii', 'replace').decode('ascii')}")
+
+
+"""
+Wraps XMLHttpRequest and fetch so we can tell three failures apart that
+otherwise look identical: the click never fired, the request fired and the
+server never answered, or it answered slower than our ceiling. Idempotent —
+re-running it on an already-instrumented page is a no-op — but a navigation
+wipes it, so it is reinstalled after every page load.
+"""
+NETWORK_PROBE_JS = """
+(function () {
+    if (window.__gvcNet) { return; }
+    var net = {inflight: 0, started: 0, finished: 0,
+               lastStatus: null, lastUrl: '', lastMs: null};
+    window.__gvcNet = net;
+
+    var open = XMLHttpRequest.prototype.open;
+    var send = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+        this.__gvcUrl = url;
+        return open.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+        var xhr = this, t0 = Date.now(), done = false;
+        net.started++;
+        net.inflight++;
+        net.lastUrl = xhr.__gvcUrl || '';
+        var finish = function () {
+            if (done) { return; }
+            done = true;
+            net.inflight = Math.max(0, net.inflight - 1);
+            net.finished++;
+            net.lastMs = Date.now() - t0;
+            try { net.lastStatus = xhr.status; } catch (e) { net.lastStatus = -1; }
+            // Cloudflare/nginx say how long to wait here when they throttle us
+            try { net.lastRetryAfter = xhr.getResponseHeader('Retry-After'); }
+            catch (e) { net.lastRetryAfter = null; }
+        };
+        ['loadend', 'error', 'abort', 'timeout'].forEach(function (evt) {
+            xhr.addEventListener(evt, finish);
+        });
+        return send.apply(this, arguments);
+    };
+
+    if (window.fetch) {
+        var realFetch = window.fetch;
+        window.fetch = function () {
+            var t0 = Date.now();
+            net.started++;
+            net.inflight++;
+            var settle = function (status) {
+                net.inflight = Math.max(0, net.inflight - 1);
+                net.finished++;
+                net.lastMs = Date.now() - t0;
+                net.lastStatus = status;
+            };
+            return realFetch.apply(this, arguments).then(
+                function (res) { settle(res.status); return res; },
+                function (err) { settle(-1); throw err; });
+        };
+    }
+})();
+"""
+
+
+def install_network_probe(driver):
+    """(Re)installs the XHR/fetch probe. Safe to call on every page load."""
+    try:
+        driver.execute_script(NETWORK_PROBE_JS)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+
+
+def read_network_state(driver) -> dict:
+    """Probe counters, or {} if the probe isn't installed on this page."""
+    try:
+        state = driver.execute_script("""
+            var n = window.__gvcNet;
+            return n ? {inflight: n.inflight, started: n.started,
+                        finished: n.finished, lastStatus: n.lastStatus,
+                        lastMs: n.lastMs, lastUrl: n.lastUrl,
+                        lastRetryAfter: n.lastRetryAfter} : null;
+        """)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return {}
+    return state or {}
 
 
 def _reraise_if_dead(err: Exception):
@@ -470,8 +610,12 @@ def wait_for_search_result(driver, timeout=None) -> bool:
     """
     if timeout is None:
         timeout = SEARCH_RESULT_WAIT_SECONDS
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    started = time.monotonic()
+    deadline = started + timeout
+    hard_deadline = started + max(timeout, SEARCH_RESULT_EXTENDED_SECONDS)
+    extended = False
+
+    while True:
         try:
             if driver.execute_script("""
                 var msg = document.querySelector('#resultMessage');
@@ -488,8 +632,149 @@ def wait_for_search_result(driver, timeout=None) -> bool:
                 return True
         except WebDriverException as err:
             _reraise_if_dead(err)
+
+        now = time.monotonic()
+        if now >= deadline:
+            # Past the normal ceiling. Keep waiting only while the page still
+            # has a request outstanding — a slow portal is not the same thing
+            # as no appointments, and calling it early is how false negatives
+            # get logged. With no probe, behave exactly as before.
+            if now >= hard_deadline or read_network_state(driver).get("inflight", 0) <= 0:
+                return False
+            if not extended:
+                debug(f"Portal has not answered in {timeout}s but a request is still "
+                      f"in flight — waiting up to {SEARCH_RESULT_EXTENDED_SECONDS}s.")
+                extended = True
+            deadline = min(hard_deadline, now + 1.0)
         time.sleep(0.15)
-    return False
+
+
+def interruptible_sleep(total_seconds: float, label: str):
+    """
+    Long pause that still lets the GUI stop the scan.
+
+    The GUI delivers Stop by raising KeyboardInterrupt out of its patched
+    print(), so a single blocking time.sleep(300) would leave the Stop button
+    dead for five minutes. Sleeping in slices and logging progress gives the
+    interrupt somewhere to land.
+    """
+    deadline = time.monotonic() + total_seconds
+    next_note = time.monotonic() + 15
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
+        if time.monotonic() >= next_note:
+            left = deadline - time.monotonic()
+            if left > 3:
+                debug(f"   {label} — {int(left)}s remaining...")
+            next_note = time.monotonic() + 15
+
+
+def pace_search():
+    """Holds each search back so we never exceed the current sustainable rate."""
+    global _last_search_at
+    if _last_search_at:
+        wait = _search_interval - (time.monotonic() - _last_search_at)
+        if wait > 0:
+            time.sleep(wait)
+    _last_search_at = time.monotonic()
+
+
+def note_search_outcome(status):
+    """
+    Tunes the search interval from what the portal actually returns.
+
+    Guessing a safe fixed rate is not possible from outside — the limit is the
+    portal's and it is not published. Widening on refusal and easing back on a
+    clean run converges on the fastest pace it will tolerate.
+    """
+    global _search_interval, _clean_searches, _rate_limit_cooldowns
+
+    if status == RATE_LIMITED_STATUS:
+        _clean_searches = 0
+        previous = _search_interval
+        _search_interval = min(SEARCH_MAX_INTERVAL_SECONDS,
+                               _search_interval * SEARCH_INTERVAL_GROWTH)
+        if _search_interval > previous:
+            debug(f"Rate limited — spacing searches {previous:.1f}s → {_search_interval:.1f}s apart.")
+        return
+
+    if status is not None and 200 <= status < 400:
+        _rate_limit_cooldowns = 0
+        _clean_searches += 1
+        if (_clean_searches >= CLEAN_SEARCHES_BEFORE_SPEEDUP
+                and _search_interval > SEARCH_MIN_INTERVAL_SECONDS):
+            _clean_searches = 0
+            previous = _search_interval
+            _search_interval = max(SEARCH_MIN_INTERVAL_SECONDS,
+                                   _search_interval * SEARCH_INTERVAL_DECAY)
+            debug(f"{CLEAN_SEARCHES_BEFORE_SPEEDUP} clean searches — easing pace "
+                  f"{previous:.1f}s → {_search_interval:.1f}s.")
+
+
+def cool_down_after_rate_limit(retry_after=None):
+    """
+    Stops sending anything until the portal's limit resets.
+
+    Deliberately does NOT reload the page. A reload costs several more HTTP
+    requests against the same exhausted budget, which is why the 04/08 run kept
+    getting 429s straight after each recovery — the limit is per IP/session and
+    survives a fresh page. The only thing that clears it is silence.
+    """
+    global _rate_limit_cooldowns
+
+    index = min(_rate_limit_cooldowns, len(RATE_LIMIT_COOLDOWN_SECONDS) - 1)
+    seconds = RATE_LIMIT_COOLDOWN_SECONDS[index]
+
+    if retry_after:
+        try:
+            seconds = max(seconds, float(retry_after))
+            debug(f"Portal sent Retry-After: {retry_after}s.")
+        except (TypeError, ValueError):
+            pass
+
+    _rate_limit_cooldowns += 1
+    print("\n" + "⛔" * 30)
+    print(f"  RATE LIMITED (HTTP {RATE_LIMITED_STATUS}) — the portal is refusing to answer.")
+    print(f"  Going quiet for {int(seconds)}s. No searches, no reloads.")
+    print(f"  Dates hit by this are NOT recorded as 'no availability'.")
+    print("⛔" * 30 + "\n")
+    interruptible_sleep(seconds, "Rate-limit cooldown")
+    debug("Cooldown finished — resuming at the slower pace.")
+
+
+def fire_search(driver):
+    """
+    Clicks Search and confirms the click actually reached the page.
+
+    A click that lands on a dead handler produces no request and no DOM change,
+    which is indistinguishable downstream from "the portal said no slots". Here
+    we watch the probe's request counter: if nothing goes out, the click is
+    retried once before we accept the result.
+    """
+    for attempt in (1, 2):
+        before = read_network_state(driver)
+        reset_search_result_state(driver)
+        safe_click(driver, "#btn-search", "#btn-search (Search)")
+
+        if before.get("started") is None:
+            return          # no probe on this page — nothing to verify against
+
+        deadline = time.monotonic() + CLICK_DISPATCH_CONFIRM_SECONDS
+        while time.monotonic() < deadline:
+            after = read_network_state(driver)
+            if after.get("started", 0) > before.get("started", 0):
+                return
+            if after.get("inflight", 0) > 0:
+                return
+            time.sleep(0.05)
+
+        if attempt == 1:
+            debug("Search click put no request on the wire — clicking once more...")
+
+    debug("⚠ Search click still produced no request after a retry.")
 
 
 def wait_for_slots_to_render(driver, timeout=None) -> bool:
@@ -705,16 +990,13 @@ def count_dates_to_scan() -> int:
     return sum(len(dates_for_type(v, start_date, end_date)) for v, _ in APPOINTMENT_TYPES)
 
 
-def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
+def select_appointment_type(driver, type_value: str, type_label: str):
     """
-    For a given appointment type, scans today + next DAYS_TO_SCAN days for available slots.
-    Returns True if slots were found (and stops), False to continue to next type.
+    Picks the appointment type and handles the Travel Purpose dropdown it can
+    reveal. Split out of the scan so an in-place reload can restore it — a
+    reload resets #type back to its default, and scanning on would silently
+    query the wrong category.
     """
-    print("\n" + "=" * 60)
-    print(f"[SCANNING] Appointment Type: {type_label}")
-    print(f"[SCANNING] Type value: {type_value}")
-    print("=" * 60)
-
     debug(f"Selecting appointment type: {type_label}...")
     if type_value == "Premium Lounge":
         human_select_dropdown(driver, "#type", type_label)
@@ -740,6 +1022,43 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     except Exception:
         pass
 
+
+def recover_stalled_page(driver, type_value: str, type_label: str):
+    """
+    In-place recovery from a stalled page: reload the form in the SAME window,
+    re-arm native clicks, and re-select the appointment type so scanning
+    resumes on the right category. Never touches the browser process, the
+    session, or the date list.
+    """
+    global _stall_recoveries, _consecutive_timeouts
+
+    backoff = STALL_BACKOFF_SECONDS[min(_stall_recoveries, len(STALL_BACKOFF_SECONDS) - 1)]
+    if backoff:
+        debug(f"⏳ Still stalling after {_stall_recoveries} recovery attempt(s) — waiting "
+              f"{backoff}s before trying again. Reloading harder would only look like "
+              f"more automated traffic to the portal.")
+        interruptible_sleep(backoff, "Stall backoff")
+
+    _stall_recoveries += 1
+    reopen_appointment_form(
+        driver,
+        f"stalled — {STALL_TIMEOUT_THRESHOLD} consecutive searches got no server response")
+    select_appointment_type(driver, type_value, type_label)
+    _consecutive_timeouts = 0
+
+
+def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
+    """
+    For a given appointment type, scans today + next DAYS_TO_SCAN days for available slots.
+    Returns True if slots were found (and stops), False to continue to next type.
+    """
+    print("\n" + "=" * 60)
+    print(f"[SCANNING] Appointment Type: {type_label}")
+    print(f"[SCANNING] Type value: {type_value}")
+    print("=" * 60)
+
+    select_appointment_type(driver, type_value, type_label)
+
     # Calculate scan range
     try:
         start_date = datetime.strptime(SCAN_START_DATE_STR, "%d/%m/%Y")
@@ -763,8 +1082,16 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
         debug(f"⚠ No dates in range match the selected weekdays ({weekday_filter}). Skipping this type.")
         return False
 
-    # Scan each day
-    for day_index, target_date in enumerate(dates):
+    # Scan each day. Index-based rather than `for ... in`: a date interrupted by
+    # a stall recovery is retried on the same index, so no configured date is
+    # ever dropped from the sweep.
+    global _consecutive_timeouts, _stall_recoveries
+    day_index = 0
+    retried_after_recovery = False
+    unchecked = []          # dates the portal refused to answer for
+
+    while day_index < len(dates):
+        target_date = dates[day_index]
         date_str = target_date.strftime("%d/%m/%Y")
 
         print(f"\n  --- Day {day_index + 1}/{days_to_scan}: "
@@ -774,11 +1101,50 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
         human_type_date(driver, "#datefrom", date_str)
 
         debug("Clicking 'Search' button (#btn-search)...")
-        reset_search_result_state(driver)
-        safe_click(driver, "#btn-search", "#btn-search (Search)")
+        pace_search()
+        fire_search(driver)
 
-        if not wait_for_search_result(driver):
-            debug(f"No response within {SEARCH_RESULT_WAIT_SECONDS}s for {date_str} — treating as no availability.")
+        if wait_for_search_result(driver):
+            _consecutive_timeouts = 0
+            _stall_recoveries = 0
+            retried_after_recovery = False
+            note_search_outcome(read_network_state(driver).get("lastStatus"))
+        else:
+            net = read_network_state(driver)
+            status = net.get("lastStatus")
+            note_search_outcome(status)
+
+            # A 429 is a refusal to answer, not an answer. Recording it as "no
+            # availability" would hide a real slot, and reloading the page to
+            # "recover" only spends more of the same exhausted budget.
+            if status == RATE_LIMITED_STATUS:
+                debug(f"⛔ Portal refused to answer for {date_str} (HTTP {status}) — "
+                      f"this date has NOT been checked.")
+                if _rate_limit_cooldowns < len(RATE_LIMIT_COOLDOWN_SECONDS):
+                    cool_down_after_rate_limit(net.get("lastRetryAfter"))
+                    continue      # same date — it was never actually queried
+                unchecked.append(date_str)
+                debug(f"⚠ Still rate-limited after {_rate_limit_cooldowns} cooldowns. "
+                      f"{date_str} stays UNCHECKED and will be retried next round.")
+                day_index += 1
+                continue
+
+            _consecutive_timeouts += 1
+            debug(f"No response within {SEARCH_RESULT_WAIT_SECONDS}s for {date_str} "
+                  f"(consecutive: {_consecutive_timeouts}) — "
+                  f"requests sent={net.get('started', '?')}, in flight={net.get('inflight', '?')}, "
+                  f"last HTTP status={status}, last took={net.get('lastMs', '?')}ms")
+
+            if _consecutive_timeouts >= STALL_TIMEOUT_THRESHOLD and not retried_after_recovery:
+                recover_stalled_page(driver, type_value, type_label)
+                retried_after_recovery = True
+                continue          # same date, freshly loaded page — nothing skipped
+
+            debug(f"Treating {date_str} as no availability.")
+
+        # Past the point of no return for this date: every branch below moves on
+        # by exactly one, so advance here and let the existing `continue`s work.
+        day_index += 1
 
         # Check if a validation modal popped up. Asking the DOM directly is
         # cheaper and steadier than N round-trips of is_displayed().
@@ -859,7 +1225,18 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
         debug(f"✗ No results or slots for {date_str}. Moving to next date...")
 
-    debug(f"✗ No slots found across {days_to_scan} days for type: {type_label}")
+    if unchecked:
+        print("\n" + "!" * 60)
+        print(f"  ⚠ {len(unchecked)} of {days_to_scan} dates were NOT checked for this type")
+        print(f"     {type_label}")
+        print(f"     The portal rate-limited us on: {', '.join(unchecked)}")
+        print(f"     These are NOT 'no availability' — they are unknown, and will")
+        print(f"     be retried on the next round.")
+        print("!" * 60)
+        debug(f"✗ No slots found across {days_to_scan - len(unchecked)} verified days "
+              f"for type: {type_label} ({len(unchecked)} unchecked)")
+    else:
+        debug(f"✗ No slots found across {days_to_scan} days for type: {type_label}")
     return False
 
 
@@ -1069,6 +1446,7 @@ def open_appointment_page(driver, attempts=3):
         debug("Waiting for appointment form to render (up to 90s)...")
         if wait_for_appointment_form(driver, timeout=90):
             debug("Appointment form (#appointment) is loaded and ready!")
+            install_network_probe(driver)   # a navigation wipes the previous one
             return True
 
         debug(f"⚠ Appointment form did not render within 90s (attempt {attempt}/{attempts}).")
@@ -1096,6 +1474,40 @@ def assert_vac_on_appointment_page(driver):
     debug(f"VAC gate passed — appointment form is querying {TARGET_CITY.capitalize()} ({expected}).")
 
 
+def reopen_appointment_form(driver, reason: str):
+    """
+    Reloads the Book Appointment form in the SAME window and re-fills it.
+
+    This is a fresh navigation, not a browser restart — the Chrome window, the
+    session and the login all survive. Used both after a manual booking and on
+    the periodic refresh, because the page can quietly lose its connection to
+    the portal and then answer every search from a dead client-side state,
+    which looks exactly like "no appointments available".
+
+    Raises on failure so the caller's recovery path can restart the browser.
+    """
+    global _NATIVE_CLICK_WORKS, _consecutive_timeouts
+
+    debug(f"↻ Reloading the appointment form ({reason})...")
+    try:
+        open_appointment_page(driver)
+        assert_vac_on_appointment_page(driver)
+
+        # Fresh DOM: re-arm the native-click probe and reinstall the network
+        # probe, both of which a navigation wipes out.
+        _NATIVE_CLICK_WORKS = True
+        _consecutive_timeouts = 0
+        debug("↻ Native-click probe re-armed (USE_JS_CLICK reset to False) for the new DOM.")
+
+        fill_applicant_fields(driver)
+    except SessionLostError:
+        raise
+    except Exception as reload_err:
+        debug(f"Could not reload appointment form ({reload_err}) — will restart browser.")
+        raise Exception("Appointment form reload failed — restarting...")
+    debug("↻ Appointment form reloaded and re-filled — resuming the scan.")
+
+
 # ============================================================================
 # BROWSER LAUNCH + LOGIN (reusable for auto-recovery)
 # ============================================================================
@@ -1106,8 +1518,15 @@ def launch_browser_and_login():
     to the appointment form and fills applicant fields.
     Returns (driver, wait) on success, or raises on failure.
     """
-    global _NATIVE_CLICK_WORKS
+    global _NATIVE_CLICK_WORKS, _consecutive_timeouts, _stall_recoveries
+    global _search_interval, _last_search_at, _clean_searches, _rate_limit_cooldowns
     _NATIVE_CLICK_WORKS = True   # fresh session — probe native clicks once more
+    _consecutive_timeouts = 0
+    _stall_recoveries = 0
+    _search_interval = SEARCH_MIN_INTERVAL_SECONDS
+    _last_search_at = 0.0
+    _clean_searches = 0
+    _rate_limit_cooldowns = 0
 
     debug("Launching Chrome Browser via Selenium...")
     options = webdriver.ChromeOptions()
@@ -1240,6 +1659,7 @@ def main():
             driver, wait = launch_browser_and_login()
 
             round_number = 0
+            rounds_since_refresh = 0
 
             # ── Inner loop: infinite scan rounds ──
             while True:
@@ -1303,14 +1723,8 @@ def main():
                     # in case the form state changed
                     if not is_browser_alive(driver):
                         raise Exception("Browser window was closed — restarting...")
-                    debug("Re-navigating to appointment form for next round...")
-                    try:
-                        open_appointment_page(driver)
-                        assert_vac_on_appointment_page(driver)
-                        fill_applicant_fields(driver)
-                    except Exception as reload_err:
-                        debug(f"Could not reload appointment form ({reload_err}) — will restart browser.")
-                        raise Exception("Appointment form reload failed — restarting...")
+                    reopen_appointment_form(driver, "returning from a manual booking")
+                    rounds_since_refresh = 0
                 else:
                     print("\n" + "-" * 60)
                     print(f"  ❌ Round {round_number} complete — no slots found.")
@@ -1318,6 +1732,16 @@ def main():
                     debug(f"Pausing {pause_secs:.1f}s before next round...")
                     print("-" * 60)
                     time.sleep(pause_secs)
+
+                    # Scheduled reload: same window, fresh page, form re-filled.
+                    rounds_since_refresh += 1
+                    if rounds_since_refresh >= REFRESH_EVERY_N_ROUNDS:
+                        if not is_browser_alive(driver):
+                            raise Exception("Browser window was closed — restarting...")
+                        reopen_appointment_form(
+                            driver,
+                            f"scheduled — {rounds_since_refresh} rounds since the last reload")
+                        rounds_since_refresh = 0
 
         except KeyboardInterrupt:
             print("\n\n" + "=" * 60)
