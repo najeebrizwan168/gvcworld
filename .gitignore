@@ -4,6 +4,16 @@ __pycache__/
 # Saved UI form values — contains personal applicant details
 gvc_ui_config.json
 
+# Persistent Chrome profile. Holds the live portal session (Default/Network/Cookies
+# plus the DPAPI key in Local State) — a login, not source. Rebuilt on first run.
+chrome_profile/
+
+# Exported portal session cookies — bearer credentials for the account.
+gvc_session.json
+
+# Scan checkpoint — runtime position, meaningless to anyone else.
+gvc_scan_state.json
+
 # PyInstaller build output — rebuild from source, don't version the binary
 build_dist/release/
 build_dist/work_release/

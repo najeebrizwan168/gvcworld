@@ -1081,15 +1081,62 @@ class App(tk.Tk):
         self._thread = threading.Thread(target=self._run_scan, args=(cfg,), daemon=True)
         self._thread.start()
 
+    def _login_override(self):
+        """Confirm-button escape hatch for the automatic login detection.
+
+        The bot detects a completed login on its own; this only matters if the
+        portal changes shape and the detection stops recognising it, so the
+        operator can still say 'I am in' and keep the run going.
+        """
+        if self._continue.is_set():
+            self._continue.clear()
+            self.after(0, self.log, "[GATE] Continue received - resuming automation.")
+            self.after(0, self._gate_closed)
+            self._hide_window()
+            return True
+        return False
+
+    def _gate_open(self, message):
+        self.confirm_btn.config(state="normal")
+        self.set_status("Waiting for you to sign in to Chrome", "waiting")
+        self.log(message)
+
+    def _gate_closed(self):
+        self.confirm_btn.config(state="disabled")
+        self.set_status("Running", "running")
+
     def _run_scan(self, cfg):
         original_print = getattr(bot, "print", None)
         original_input = getattr(bot, "input", None)
         original_webdriver = bot.webdriver
+        original_ready = getattr(bot, "ON_SESSION_READY", None)
+        original_override = getattr(bot, "LOGIN_OVERRIDE", None)
+        gate_shown = threading.Event()
+
+        def on_session_ready():
+            """The bot got in with no human needed — put Chrome back out of sight."""
+            self.after(0, self.log, "[SESSION] Signed in from the saved profile - no login needed.")
+            self._hide_window()
 
         def patched_print(*args, **kwargs):
             if self._stop.is_set():
                 raise KeyboardInterrupt("stopped from UI")
             text = kwargs.get("sep", " ").join(str(a) for a in args)
+
+            # The login gate is no longer an input() call — the bot polls for the
+            # login instead — so the Confirm button is armed off the bot's own
+            # heartbeat line, the first time it appears.
+            if "[GATE] Waiting for you to finish signing in" in text and not gate_shown.is_set():
+                gate_shown.set()
+                self._continue.clear()
+                self._show_window()
+                self.after(0, self._gate_open,
+                           "[GATE] Sign in to Chrome - the scanner will detect it automatically.")
+            elif "Login detected" in text and gate_shown.is_set():
+                gate_shown.clear()          # re-arms if a later session expires
+                self.after(0, self._gate_closed)
+                self._hide_window()
+
             for line in text.split("\n"):
                 if line.strip():
                     self.after(0, self.log, line.rstrip())
@@ -1152,6 +1199,8 @@ class App(tk.Tk):
 
             bot.print = patched_print
             bot.input = patched_input
+            bot.ON_SESSION_READY = on_session_ready
+            bot.LOGIN_OVERRIDE = self._login_override
             bot.webdriver = WebDriverProxy(original_webdriver, self._track_driver)
 
             self.after(0, lambda: self.set_status("Running", "running"))
@@ -1175,6 +1224,8 @@ class App(tk.Tk):
                     pass
 
             bot.webdriver = original_webdriver
+            bot.ON_SESSION_READY = original_ready
+            bot.LOGIN_OVERRIDE = original_override
             if original_print is None:
                 bot.__dict__.pop("print", None)
             else:

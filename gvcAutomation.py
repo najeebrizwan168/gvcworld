@@ -1,6 +1,11 @@
+import os
 import re
+import sys
+import json
 import time
 import random
+import hashlib
+from pathlib import Path
 from datetime import datetime, timedelta
 
 from selenium import webdriver
@@ -117,10 +122,6 @@ SEARCH_INTERVAL_GROWTH = 1.5
 SEARCH_INTERVAL_DECAY = 0.9
 CLEAN_SEARCHES_BEFORE_SPEEDUP = 10
 
-# How long to send nothing at all once rate-limited. Measured, not guessed: in
-# the 04/08 trace pausing 60s and 180s did not clear the limit, 300s did.
-RATE_LIMIT_COOLDOWN_SECONDS = (300, 600, 900)
-
 _search_interval = SEARCH_MIN_INTERVAL_SECONDS
 _last_search_at = 0.0
 _clean_searches = 0
@@ -134,8 +135,75 @@ DASHBOARD_STABILIZE_SECONDS = 5
 _NATIVE_CLICK_WORKS = True
 
 
+# ── Where persistent state lives ────────────────────────────────────────────
+# Beside the .exe when frozen, beside the source otherwise — same rule the GUI
+# already uses for its config, so everything a user might need to delete sits
+# together in one folder.
+if getattr(sys, "frozen", False):
+    PERSIST_DIR = Path(sys.executable).resolve().parent
+else:
+    PERSIST_DIR = Path(__file__).resolve().parent
+
+# Chrome's own profile. Keeping it means the portal's login survives a browser
+# restart, which is what makes an automatic restart cheap enough to use as a
+# recovery step at all — without it every restart would need a human at the
+# reCAPTCHA.
+CHROME_PROFILE_DIR = PERSIST_DIR / "chrome_profile"
+
+# Cookies exported from a good session, as a belt-and-braces backup: a Chrome
+# profile can be invalidated by a crash or a version upgrade, and re-injecting
+# the cookies restores the session without one.
+SESSION_FILE = PERSIST_DIR / "gvc_session.json"
+
+# Where the scan is up to. Rewritten before every individual date search so an
+# interrupted run resumes on the exact date it was interrupted on.
+SCAN_STATE_FILE = PERSIST_DIR / "gvc_scan_state.json"
+
+# Cookie names that indicate a live portal session. Substring match, lowercased
+# — the portal is ASP.NET today but the check shouldn't be brittle about it.
+SESSION_COOKIE_HINTS = ("session", "sessid", "asp.net", "auth", "token",
+                        "phpsess", "laravel")
+
+# How long to let the driver and its profile lock clear after quitting Chrome
+# before starting it again. Too short and Chrome refuses with "user data
+# directory is already in use".
+DRIVER_CLEANUP_SECONDS = 12
+
+# Ceiling on the wait for a human to finish signing in. Polled, so a fast login
+# costs nothing — this only bounds how long an abandoned run waits.
+LOGIN_DETECT_TIMEOUT_SECONDS = 900
+
+# What to do when the portal rate-limits us, indexed by how many times it has
+# happened without a clean search in between. The first entry is just the
+# driver-cleanup pause: restart immediately, resume from the checkpoint, and see
+# whether a fresh browser session is enough. If it isn't, escalate to going
+# properly quiet — silence is the only thing measured to clear this portal's
+# limit, and a restart on its own does not (the limit follows the IP, not the
+# browser). With Chrome closed the quiet is real: no background polling either.
+RATE_LIMIT_RESTART_WAITS = (DRIVER_CLEANUP_SECONDS, 300, 600, 900)
+
+# Optional callbacks installed by the GUI; both stay None under the terminal
+# runner and are only ever called if they are callable.
+ON_SESSION_READY = None    # called when a session comes up with no human needed
+LOGIN_OVERRIDE = None      # returns True if the operator says "I am signed in"
+
+
 class SessionLostError(Exception):
     """Raised when the portal has bounced us back to the login page."""
+
+
+class RateLimitRestart(Exception):
+    """
+    Raised when the portal answers a search with HTTP 429.
+
+    Carries no state of its own — the scan position is already on disk in
+    SCAN_STATE_FILE by the time this is raised, so the handler in main() can
+    tear the browser down and rebuild it without losing the place.
+    """
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 # ============================================================================
@@ -246,6 +314,297 @@ def _reraise_if_dead(err: Exception):
     auto-recovery loop restarts instead of us silently retrying forever."""
     if isinstance(err, (InvalidSessionIdException, NoSuchWindowException)):
         raise err
+
+
+# ============================================================================
+# SESSION PERSISTENCE — profile, cookies, login detection
+# ============================================================================
+def _write_json_atomically(path: Path, payload: dict) -> bool:
+    """Writes via a temp file and one rename, so a crash mid-write can never
+    leave a half-written state file that fails to parse on the next run."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError as err:
+        debug(f"⚠ Could not write {path.name} ({err}).")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _is_session_cookie(cookie: dict) -> bool:
+    name = str(cookie.get("name", "")).lower()
+    return any(hint in name for hint in SESSION_COOKIE_HINTS)
+
+
+def portal_session_cookies(driver) -> list:
+    """The session cookies the browser is currently holding for the portal."""
+    try:
+        cookies = driver.get_cookies() or []
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return []
+    return [c for c in cookies if _is_session_cookie(c)]
+
+
+def save_session_cookies(driver) -> bool:
+    """
+    Exports the authenticated cookies so a later launch can skip the login gate
+    even if the Chrome profile itself is unusable.
+
+    Cookie *values* are secrets — they are a bearer token for this account — so
+    they are written to disk but never logged.
+    """
+    try:
+        cookies = driver.get_cookies() or []
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return False
+
+    if not any(_is_session_cookie(c) for c in cookies):
+        debug("No portal session cookie to save yet.")
+        return False
+
+    ok = _write_json_atomically(SESSION_FILE, {
+        "version": 1,
+        "account": USER_EMAIL,
+        "origin": TARGET_URL,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "cookies": cookies,
+    })
+    if ok:
+        debug(f"🔐 Saved {len(cookies)} cookie(s) — next launch can skip the login gate.")
+    return ok
+
+
+def load_session_cookies() -> list:
+    """Saved cookies for *this* account, or [] if there are none to use."""
+    try:
+        payload = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+    account = payload.get("account")
+    if account and account != USER_EMAIL:
+        debug("The saved session belongs to a different account — ignoring it.")
+        return []
+    return [c for c in payload.get("cookies", [])
+            if isinstance(c, dict) and c.get("name")]
+
+
+def clear_session_cookies():
+    try:
+        SESSION_FILE.unlink()
+    except OSError:
+        pass
+
+
+def inject_session_cookies(driver, cookies) -> int:
+    """
+    Adds saved cookies to the live browser. Must be called while already on the
+    portal's origin — Chrome rejects a cookie whose domain doesn't match the
+    current page. Returns how many were accepted.
+    """
+    added = 0
+    now = time.time()
+    for cookie in cookies:
+        entry = {k: v for k, v in cookie.items()
+                 if k in ("name", "value", "path", "domain", "secure",
+                          "httpOnly", "expiry", "sameSite")}
+        expiry = entry.get("expiry")
+        if isinstance(expiry, (int, float)) and expiry <= now:
+            continue                       # already dead; adding it just fails
+        if entry.get("sameSite") not in ("Strict", "Lax", "None"):
+            entry.pop("sameSite", None)    # Chrome rejects anything else
+        try:
+            driver.add_cookie(entry)
+            added += 1
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+            # A leading-dot domain Chrome won't take for this exact origin —
+            # retry letting it infer the domain from the current page.
+            entry.pop("domain", None)
+            try:
+                driver.add_cookie(entry)
+                added += 1
+            except WebDriverException:
+                pass
+    return added
+
+
+def is_logged_in(driver) -> bool:
+    """
+    True when the browser is holding a usable portal session.
+
+    Deliberately assertion-based rather than time-based: the login page's own
+    fields disappearing plus either an app-only element or a session cookie is
+    what actually distinguishes "signed in" from "still on the form".
+    """
+    try:
+        state = driver.execute_script("""
+            return {
+                login: !!(document.querySelector('#username')
+                          && document.querySelector('#password')),
+                app:   !!(document.querySelector('#appointment')
+                          || document.querySelector('a[href*="/appointments"]')
+                          || document.querySelector('a[href*="logout"]')
+                          || document.querySelector('a[href*="/user/"]'))
+            };
+        """)
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return False
+
+    if not state or state.get("login"):
+        return False
+    return bool(state.get("app")) or bool(portal_session_cookies(driver))
+
+
+def wait_for_login(driver, timeout=LOGIN_DETECT_TIMEOUT_SECONDS) -> bool:
+    """
+    Blocks until the portal session is live, detected rather than timed.
+
+    The operator solves the reCAPTCHA and clicks Sign In; this notices when that
+    worked. The GUI's Confirm button stays wired as a manual override for the
+    case where the portal changes and the detection stops recognising it.
+    """
+    debug("Watching for the login to complete (no fixed delay — this polls)...")
+    deadline = time.monotonic() + timeout
+    next_note = time.monotonic()
+
+    while time.monotonic() < deadline:
+        if callable(LOGIN_OVERRIDE):
+            try:
+                if LOGIN_OVERRIDE():
+                    debug("Login confirmed manually — continuing.")
+                    return True
+            except Exception:
+                pass
+
+        if is_logged_in(driver):
+            debug("✓ Login detected — the portal session is live.")
+            return True
+
+        if time.monotonic() >= next_note:
+            # Also the heartbeat the GUI's Stop button lands on.
+            print("  [GATE] Waiting for you to finish signing in in Chrome...")
+            next_note = time.monotonic() + 10
+        time.sleep(0.5)
+
+    return False
+
+
+def restore_session(driver) -> bool:
+    """
+    Phase B: try to reach an authenticated state with no human involved.
+
+    Two independent sources, tried together — the Chrome profile carries the
+    session on its own, and the exported cookies cover the case where the
+    profile has been reset. Returns False if neither works, which is the signal
+    to fall back to the manual login gate.
+    """
+    debug("Checking for a saved portal session...")
+    driver.get(TARGET_URL)
+    install_network_probe(driver)
+
+    if is_logged_in(driver):
+        debug("✓ The saved Chrome profile is still signed in — skipping the login gate.")
+        return True
+
+    cookies = load_session_cookies()
+    if not cookies:
+        debug("No saved session found — a one-time manual login is needed.")
+        return False
+
+    added = inject_session_cookies(driver, cookies)
+    debug(f"Injected {added} saved cookie(s); reloading to let the portal see them...")
+    driver.get(TARGET_URL)
+    install_network_probe(driver)
+
+    if is_logged_in(driver):
+        debug("✓ Saved cookies restored the session — skipping the login gate.")
+        return True
+
+    debug("The saved session has expired — a manual login is needed.")
+    clear_session_cookies()
+    return False
+
+
+# ============================================================================
+# SCAN CHECKPOINT — resume from the exact type + date after a restart
+# ============================================================================
+def scan_signature() -> str:
+    """
+    Fingerprints the scan configuration.
+
+    A checkpoint is only meaningful against the settings it was taken under: if
+    the date range, the type list, the weekday filter or the city has changed,
+    the stored date *index* points at a different date and resuming from it
+    would skip real dates. Mismatched checkpoints are discarded, not adapted.
+    """
+    parts = [
+        USER_EMAIL, TARGET_CITY, SCAN_START_DATE_STR, SCAN_END_DATE_STR,
+        "|".join(v for v, _ in APPOINTMENT_TYPES),
+        "|".join(f"{k}:{','.join(str(d) for d in sorted(v))}"
+                 for k, v in sorted(SCAN_WEEKDAYS.items())),
+    ]
+    return hashlib.sha1("~".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def save_checkpoint(round_number, type_value, type_label, date_index, date_str,
+                    completed_dates, completed_types):
+    """
+    Records the date that is about to be searched — not the one just finished.
+
+    That direction matters: whatever kills the run kills it *during* a search,
+    and pointing the checkpoint at the in-flight date means the restart redoes
+    it rather than assuming it came back empty.
+    """
+    _write_json_atomically(SCAN_STATE_FILE, {
+        "version": 1,
+        "signature": scan_signature(),
+        "round": round_number,
+        "last_appointment_type": type_value,
+        "last_appointment_label": type_label,
+        "last_date_index": date_index,
+        "last_date_searched": date_str,
+        "completed_dates_list": list(completed_dates),
+        "completed_types": list(completed_types),
+        "search_interval": round(_search_interval, 2),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+def load_checkpoint():
+    """The saved scan position, or None if there isn't a usable one."""
+    try:
+        payload = json.loads(SCAN_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return None
+    if payload.get("signature") != scan_signature():
+        debug("A checkpoint exists but the scan settings have changed since — "
+              "starting a clean round instead of resuming into the wrong dates.")
+        clear_checkpoint()
+        return None
+    if not isinstance(payload.get("last_date_index"), int):
+        return None
+    return payload
+
+
+def clear_checkpoint():
+    """Drops the checkpoint. Called when a round finishes cleanly — a stale one
+    would make the next fresh run resume into the middle of a finished sweep."""
+    try:
+        SCAN_STATE_FILE.unlink()
+    except OSError:
+        pass
 
 
 def safe_click(driver, target, description="element") -> bool:
@@ -714,35 +1073,33 @@ def note_search_outcome(status):
                   f"{previous:.1f}s → {_search_interval:.1f}s.")
 
 
-def cool_down_after_rate_limit(retry_after=None):
+def rate_limit_restart_wait(retry_after=None) -> float:
     """
-    Stops sending anything until the portal's limit resets.
+    How long to stay off the wire before the post-429 restart reconnects.
 
-    Deliberately does NOT reload the page. A reload costs several more HTTP
-    requests against the same exhausted budget, which is why the 04/08 run kept
-    getting 429s straight after each recovery — the limit is per IP/session and
-    survives a fresh page. The only thing that clears it is silence.
+    Escalates per consecutive rate-limit event: the first is the plain
+    driver-cleanup pause, so the restart-and-resume completes in seconds as
+    intended. If the portal 429s us again straight after that restart, it has
+    told us the limit is not tied to the browser session, and the wait steps up
+    to a genuine quiet period — the only thing measured to clear it.
+
+    _rate_limit_cooldowns is zeroed by note_search_outcome() on the first clean
+    search, so a one-off 429 never leaves us permanently slow.
     """
     global _rate_limit_cooldowns
 
-    index = min(_rate_limit_cooldowns, len(RATE_LIMIT_COOLDOWN_SECONDS) - 1)
-    seconds = RATE_LIMIT_COOLDOWN_SECONDS[index]
+    index = min(_rate_limit_cooldowns, len(RATE_LIMIT_RESTART_WAITS) - 1)
+    seconds = float(RATE_LIMIT_RESTART_WAITS[index])
 
     if retry_after:
         try:
             seconds = max(seconds, float(retry_after))
-            debug(f"Portal sent Retry-After: {retry_after}s.")
+            debug(f"Portal sent Retry-After: {retry_after}s — honouring it.")
         except (TypeError, ValueError):
             pass
 
     _rate_limit_cooldowns += 1
-    print("\n" + "⛔" * 30)
-    print(f"  RATE LIMITED (HTTP {RATE_LIMITED_STATUS}) — the portal is refusing to answer.")
-    print(f"  Going quiet for {int(seconds)}s. No searches, no reloads.")
-    print(f"  Dates hit by this are NOT recorded as 'no availability'.")
-    print("⛔" * 30 + "\n")
-    interruptible_sleep(seconds, "Rate-limit cooldown")
-    debug("Cooldown finished — resuming at the slower pace.")
+    return seconds
 
 
 def fire_search(driver):
@@ -1047,10 +1404,16 @@ def recover_stalled_page(driver, type_value: str, type_label: str):
     _consecutive_timeouts = 0
 
 
-def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
+def scan_dates_for_type(driver, type_value: str, type_label: str,
+                        resume=None, round_number=0, completed_types=()) -> bool:
     """
     For a given appointment type, scans today + next DAYS_TO_SCAN days for available slots.
     Returns True if slots were found (and stops), False to continue to next type.
+
+    `resume` is a checkpoint from an interrupted run. When it belongs to this
+    appointment type the sweep restarts at the exact date index it recorded, so
+    a browser restart costs nothing but the time it took — no date is re-searched
+    unnecessarily and, more importantly, none is skipped.
     """
     print("\n" + "=" * 60)
     print(f"[SCANNING] Appointment Type: {type_label}")
@@ -1088,11 +1451,30 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
     global _consecutive_timeouts, _stall_recoveries
     day_index = 0
     retried_after_recovery = False
-    unchecked = []          # dates the portal refused to answer for
+    checked = []            # dates this type has genuinely had an answer for
+
+    # Pick the sweep back up where the last run was cut off, but only if the
+    # checkpoint was taken on this same appointment type.
+    if resume and resume.get("last_appointment_type") == type_value:
+        resume_index = resume.get("last_date_index", 0)
+        checked = [d for d in resume.get("completed_dates_list", []) if isinstance(d, str)]
+        if 0 <= resume_index < len(dates):
+            day_index = resume_index
+            debug(f"▶ Resuming this type at day {day_index + 1}/{days_to_scan} "
+                  f"({resume.get('last_date_searched')}) — "
+                  f"{len(checked)} date(s) already checked before the interruption.")
+        else:
+            debug("▶ Checkpoint index is outside the current range — scanning this type from the start.")
 
     while day_index < len(dates):
         target_date = dates[day_index]
         date_str = target_date.strftime("%d/%m/%Y")
+
+        # Written before the search, not after: whatever interrupts us
+        # interrupts an in-flight search, and the restart must redo that date
+        # rather than assume it came back empty.
+        save_checkpoint(round_number, type_value, type_label, day_index, date_str,
+                        checked, completed_types)
 
         print(f"\n  --- Day {day_index + 1}/{days_to_scan}: "
               f"{WEEKDAY_NAMES[target_date.weekday()]} {date_str} ---")
@@ -1108,26 +1490,30 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
             _consecutive_timeouts = 0
             _stall_recoveries = 0
             retried_after_recovery = False
-            note_search_outcome(read_network_state(driver).get("lastStatus"))
+            status = read_network_state(driver).get("lastStatus")
+            note_search_outcome(status)
+
+            # A 429 that lands inside the wait window is still a refusal, not an
+            # answer — the panel simply didn't change. Same handling as below.
+            if status == RATE_LIMITED_STATUS:
+                raise RateLimitRestart(
+                    f"HTTP {RATE_LIMITED_STATUS} on {date_str} ({type_label})",
+                    retry_after=read_network_state(driver).get("lastRetryAfter"))
         else:
             net = read_network_state(driver)
             status = net.get("lastStatus")
             note_search_outcome(status)
 
-            # A 429 is a refusal to answer, not an answer. Recording it as "no
-            # availability" would hide a real slot, and reloading the page to
-            # "recover" only spends more of the same exhausted budget.
+            # A 429 is a refusal to answer, not an answer of "no appointments".
+            # Recording it as no-availability would hide a real slot, so the
+            # date stays uncommitted, the checkpoint above still points at it,
+            # and the restart handler in main() picks it back up from there.
             if status == RATE_LIMITED_STATUS:
                 debug(f"⛔ Portal refused to answer for {date_str} (HTTP {status}) — "
-                      f"this date has NOT been checked.")
-                if _rate_limit_cooldowns < len(RATE_LIMIT_COOLDOWN_SECONDS):
-                    cool_down_after_rate_limit(net.get("lastRetryAfter"))
-                    continue      # same date — it was never actually queried
-                unchecked.append(date_str)
-                debug(f"⚠ Still rate-limited after {_rate_limit_cooldowns} cooldowns. "
-                      f"{date_str} stays UNCHECKED and will be retried next round.")
-                day_index += 1
-                continue
+                      f"this date has NOT been checked and will be retried after the restart.")
+                raise RateLimitRestart(
+                    f"HTTP {RATE_LIMITED_STATUS} on {date_str} ({type_label})",
+                    retry_after=net.get("lastRetryAfter"))
 
             _consecutive_timeouts += 1
             debug(f"No response within {SEARCH_RESULT_WAIT_SECONDS}s for {date_str} "
@@ -1145,6 +1531,8 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
         # Past the point of no return for this date: every branch below moves on
         # by exactly one, so advance here and let the existing `continue`s work.
         day_index += 1
+        if date_str not in checked:
+            checked.append(date_str)
 
         # Check if a validation modal popped up. Asking the DOM directly is
         # cheaper and steadier than N round-trips of is_displayed().
@@ -1225,18 +1613,7 @@ def scan_dates_for_type(driver, type_value: str, type_label: str) -> bool:
 
         debug(f"✗ No results or slots for {date_str}. Moving to next date...")
 
-    if unchecked:
-        print("\n" + "!" * 60)
-        print(f"  ⚠ {len(unchecked)} of {days_to_scan} dates were NOT checked for this type")
-        print(f"     {type_label}")
-        print(f"     The portal rate-limited us on: {', '.join(unchecked)}")
-        print(f"     These are NOT 'no availability' — they are unknown, and will")
-        print(f"     be retried on the next round.")
-        print("!" * 60)
-        debug(f"✗ No slots found across {days_to_scan - len(unchecked)} verified days "
-              f"for type: {type_label} ({len(unchecked)} unchecked)")
-    else:
-        debug(f"✗ No slots found across {days_to_scan} days for type: {type_label}")
+    debug(f"✗ No slots found across {days_to_scan} days for type: {type_label}")
     return False
 
 
@@ -1511,28 +1888,29 @@ def reopen_appointment_form(driver, reason: str):
 # ============================================================================
 # BROWSER LAUNCH + LOGIN (reusable for auto-recovery)
 # ============================================================================
-def launch_browser_and_login():
+def start_chrome():
     """
-    Launches a fresh Chrome browser, navigates to the portal, fills login
-    credentials, waits for user to solve CAPTCHA & login, then navigates
-    to the appointment form and fills applicant fields.
-    Returns (driver, wait) on success, or raises on failure.
-    """
-    global _NATIVE_CLICK_WORKS, _consecutive_timeouts, _stall_recoveries
-    global _search_interval, _last_search_at, _clean_searches, _rate_limit_cooldowns
-    _NATIVE_CLICK_WORKS = True   # fresh session — probe native clicks once more
-    _consecutive_timeouts = 0
-    _stall_recoveries = 0
-    _search_interval = SEARCH_MIN_INTERVAL_SECONDS
-    _last_search_at = 0.0
-    _clean_searches = 0
-    _rate_limit_cooldowns = 0
+    Starts Chrome against the persistent profile directory.
 
+    The persistent profile is what makes an automatic restart viable: cookies,
+    local storage and the portal's own device trust all survive, so a rebuilt
+    browser lands back on an authenticated session instead of a reCAPTCHA.
+    """
     debug("Launching Chrome Browser via Selenium...")
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
     # Guarantee a real viewport even when the window is hidden off-screen
     options.add_argument("--window-size=1920,1080")
+
+    # Persist the whole browser profile between runs and across restarts.
+    try:
+        CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
+        options.add_argument("--profile-directory=Default")
+        debug(f"Using saved Chrome profile: {CHROME_PROFILE_DIR}")
+    except OSError as err:
+        debug(f"⚠ Could not use a persistent Chrome profile ({err}) — "
+              f"this run will need a manual login.")
 
     # ── Keep the renderer at full speed while the window is hidden ──
     # win_hide puts the window through SW_HIDE, so Chrome backgrounds the
@@ -1550,20 +1928,39 @@ def launch_browser_and_login():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
+    # A just-closed Chrome can still be holding the profile lock. That is
+    # expected on a restart, not an error — wait for it rather than failing.
+    last_error = None
+    for attempt in (1, 2, 3):
+        try:
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options
+            )
+            break
+        except WebDriverException as err:
+            last_error = err
+            if "user data directory is already in use" not in str(err).lower():
+                raise
+            debug(f"The Chrome profile is still locked by the closing browser "
+                  f"(attempt {attempt}/3) — waiting for it to let go...")
+            interruptible_sleep(DRIVER_CLEANUP_SECONDS, "Waiting for the Chrome profile")
+    else:
+        raise last_error
 
     # Remove webdriver flag to reduce detection
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"}
     )
+    return driver
 
-    debug("Browser opened. Pausing like a human looking at the screen...")
-    random_pause(3.0, 5.0)
 
+def perform_manual_login(driver):
+    """
+    Phase A: the one-time gate. The operator signs in by hand; we detect when
+    that has worked and export the session so it never has to happen again.
+    """
     debug(f"Navigating to Visa Portal: {TARGET_URL}")
     driver.get(TARGET_URL)
 
@@ -1605,17 +2002,60 @@ def launch_browser_and_login():
     handle_recaptcha(driver)
 
     print("\n" + "=" * 60)
-    print("[ACTION REQUIRED] MANUAL INTERVENTION GATE:")
+    print("[ACTION REQUIRED] MANUAL INTERVENTION GATE (one time only):")
     print("1. Solve any reCAPTCHA image puzzles if presented.")
     print("2. Click 'Sign In' / Login button.")
+    print("The scanner detects the successful login on its own — the session is")
+    print("then saved, so later launches and restarts skip this gate entirely.")
     print("=" * 60 + "\n")
 
-    input("Press ENTER in terminal ONLY AFTER successful login...")
-    debug("Terminal gate passed — login confirmed by user.")
+    if not wait_for_login(driver):
+        raise Exception(
+            f"No login detected within {LOGIN_DETECT_TIMEOUT_SECONDS}s. "
+            f"Last page state: {describe_page(driver)}")
 
     debug(f"Waiting {DASHBOARD_STABILIZE_SECONDS} seconds for dashboard to stabilize...")
     time.sleep(DASHBOARD_STABILIZE_SECONDS)
-    
+
+    # Persist it immediately: this is the only moment we are certain the session
+    # is good, and it is what every later launch will restore from.
+    save_session_cookies(driver)
+
+
+def launch_browser_and_login():
+    """
+    Brings up an authenticated browser sitting on a filled appointment form.
+
+    Phase B first — a saved profile/cookies get us straight in with nobody
+    watching, which is what lets a rate-limit restart be fully automatic.
+    Phase A (the manual gate) only runs when there is no usable session.
+    Returns (driver, wait), or raises on failure.
+    """
+    global _NATIVE_CLICK_WORKS, _consecutive_timeouts, _stall_recoveries
+    _NATIVE_CLICK_WORKS = True   # fresh session — probe native clicks once more
+    _consecutive_timeouts = 0
+    _stall_recoveries = 0
+    # Pacing state is deliberately NOT reset here: what the portal will tolerate
+    # is a property of the portal, not of this browser process, and throwing the
+    # learned interval away on every restart would walk straight back into 429.
+
+    driver = start_chrome()
+    unattended = restore_session(driver)
+
+    if unattended:
+        # Nobody had to touch it, so nothing showed the Chrome window to the
+        # operator — tell the GUI it can go back to running hidden.
+        if callable(ON_SESSION_READY):
+            try:
+                ON_SESSION_READY()
+            except Exception:
+                pass
+        save_session_cookies(driver)     # refresh the copy on disk
+    else:
+        debug("Browser opened. Pausing like a human looking at the screen...")
+        random_pause(3.0, 5.0)
+        perform_manual_login(driver)
+
     # Sync VAC before booking
     ensure_vac(driver)
 
@@ -1630,7 +2070,19 @@ def launch_browser_and_login():
 
     fill_applicant_fields(driver)
 
-    return driver, wait
+    return driver, WebDriverWait(driver, 30)
+
+
+def shutdown_browser(driver):
+    """Closes Chrome. Used by the restart path, where the teardown has to happen
+    before the wait rather than after it."""
+    if driver is None:
+        return
+    try:
+        driver.quit()
+        debug("Chrome closed.")
+    except Exception:
+        pass
 
 
 def is_browser_alive(driver) -> bool:
@@ -1645,12 +2097,52 @@ def is_browser_alive(driver) -> bool:
 # ============================================================================
 # MAIN — INFINITE SCAN LOOP WITH AUTO-RECOVERY
 # ============================================================================
+def resume_types(types_to_scan, pending):
+    """
+    Trims a round's type list down to what the interrupted run still owes.
+
+    Types already finished this round are dropped, and the list is rotated so it
+    starts on the type that was interrupted — so a restart never re-sweeps
+    completed categories and never resumes into the wrong one.
+    """
+    if not pending:
+        return types_to_scan
+
+    done = set(pending.get("completed_types", []))
+    remaining = [t for t in types_to_scan if t[0] not in done]
+
+    resume_at = pending.get("last_appointment_type")
+    if resume_at and any(t[0] == resume_at for t in remaining):
+        while remaining[0][0] != resume_at:
+            remaining.append(remaining.pop(0))
+    return remaining
+
+
 def main():
+    global _search_interval, _last_search_at, _clean_searches, _rate_limit_cooldowns
+
     print("=" * 60)
     print("  GVCW VISA APPOINTMENT SLOT SCANNER")
     print("  Selenium Undetected Chrome Runtime")
     print("  ♾️  CONTINUOUS MODE — will scan forever until you stop it")
     print("=" * 60)
+
+    _search_interval = SEARCH_MIN_INTERVAL_SECONDS
+    _last_search_at = 0.0
+    _clean_searches = 0
+    _rate_limit_cooldowns = 0
+
+    round_number = 0
+    # Survives browser restarts — this is what turns a teardown into a pause
+    # rather than a lost round.
+    pending = load_checkpoint()
+    if pending:
+        _search_interval = max(_search_interval,
+                               float(pending.get("search_interval") or 0))
+        print(f"  ▶ Resuming an interrupted scan: round {pending.get('round')}, "
+              f"{pending.get('last_appointment_label')}, "
+              f"{pending.get('last_date_searched')}")
+        print(f"    Pacing restored to {_search_interval:.1f}s between searches.")
 
     # ── Outer loop: auto-recovers if the browser dies ──
     while True:
@@ -1658,12 +2150,14 @@ def main():
         try:
             driver, wait = launch_browser_and_login()
 
-            round_number = 0
             rounds_since_refresh = 0
 
             # ── Inner loop: infinite scan rounds ──
             while True:
-                round_number += 1
+                # A resumed round keeps its original number so the log reads
+                # continuously across the restart.
+                round_number = (pending.get("round", round_number)
+                                if pending else round_number + 1)
 
                 # Health-check before each round
                 if not is_browser_alive(driver):
@@ -1697,19 +2191,34 @@ def main():
                 # APPOINTMENT_TYPES acts as the "enabled" list coming from the GUI
                 enabled_values = {v for v, l in APPOINTMENT_TYPES}
                 types_to_scan = [t for t in current_types if t[0] in enabled_values]
-                
+
+                # Everything this round has already finished, so a restart part
+                # way through picks up the remainder rather than starting over.
+                completed_types = list(pending.get("completed_types", [])) if pending else []
+                types_to_scan = resume_types(types_to_scan, pending)
+
                 for type_value, type_label in types_to_scan:
                     # Health-check before each type
                     if not is_browser_alive(driver):
                         raise Exception("Browser window was closed or crashed — restarting...")
 
-                    result = scan_dates_for_type(driver, type_value, type_label)
+                    result = scan_dates_for_type(
+                        driver, type_value, type_label,
+                        resume=pending, round_number=round_number,
+                        completed_types=completed_types)
+                    pending = None          # consumed — only the first type resumes
+                    completed_types.append(type_value)
                     if result:
                         slots_found = True
                         break
                     debug("Moving to next appointment type...")
                     random_pause(1.0, 2.0)
                     human_mouse_move(driver)
+
+                # The round is over: no half-finished position left to resume
+                # into, so the checkpoint would only mislead the next start.
+                pending = None
+                clear_checkpoint()
 
                 if slots_found:
                     print("\n" + "=" * 60)
@@ -1749,14 +2258,47 @@ def main():
             print("=" * 60)
             break
 
+        except RateLimitRestart as limited:
+            # The checkpoint already points at the date the portal refused, so
+            # the browser can go and come back without costing us that date.
+            pending = load_checkpoint()
+            shutdown_browser(driver)
+            driver = None
+
+            seconds = rate_limit_restart_wait(limited.retry_after)
+            print("\n" + "⛔" * 30)
+            print(f"  RATE LIMITED — {limited}")
+            print(f"  Progress saved: round {round_number}, "
+                  f"{pending.get('last_appointment_label') if pending else '?'}, "
+                  f"{pending.get('last_date_searched') if pending else '?'}")
+            print(f"  Chrome closed. Reconnecting in {int(seconds)}s and resuming")
+            print(f"  from that exact date — nothing is recorded as 'no availability'.")
+            print("⛔" * 30 + "\n")
+
+            interruptible_sleep(seconds, "Rate-limit recovery")
+            debug("Relaunching from the saved profile and picking the scan back up...")
+
         except Exception as e:
             print(f"\n[ERROR] {e}")
             import traceback
             traceback.print_exc()
+
+            # A crash mid-round is worth resuming from too — same checkpoint.
+            pending = load_checkpoint()
+            if isinstance(e, SessionLostError):
+                # The saved cookies are what just failed; keep them and the next
+                # launch would silently retry a dead session.
+                clear_session_cookies()
+                print("  The portal session expired — you will be asked to sign in once more.")
+            if pending:
+                print(f"  Progress kept: round {pending.get('round')}, "
+                      f"{pending.get('last_appointment_label')}, "
+                      f"{pending.get('last_date_searched')}.")
+
             print("\n" + "=" * 60)
-            print("  🔁 AUTO-RECOVERY: Will reopen browser from login page in 10 seconds...")
+            print("  🔁 AUTO-RECOVERY: Will reopen the browser in 10 seconds...")
             print("=" * 60)
-            time.sleep(10)
+            interruptible_sleep(10, "Auto-recovery")
 
         finally:
             # Try to close the old browser if it's still around
