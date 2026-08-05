@@ -14,6 +14,10 @@ gvc_session.json
 # Scan checkpoint — runtime position, meaningless to anyone else.
 gvc_scan_state.json
 
+# Per-run session transcripts. Runtime output, and they quote the applicant's
+# own details back at you — not source.
+logs/
+
 # PyInstaller build output — rebuild from source, don't version the binary
 build_dist/release/
 build_dist/work_release/

@@ -68,6 +68,83 @@ GENDER_CHOICES = [
     {"value": "3", "label": "Other"},
 ]
 
+# The three centres the profile page's #vac select offers. Stored lower-case and
+# normalised by bot.vac_key(), so an older config saying "islamabad" still loads.
+VAC_CHOICES = ["islamabad", "lahore", "verification office"]
+
+# "Booking as" (#bookingfor). Short labels — the portal's own wording,
+# "Group (Family/Traveler)", does not fit beside the weekday toggles.
+BOOKING_FOR_CHOICES = [
+    {"value": "0", "label": "Individual"},
+    {"value": "1", "label": "Group"},
+]
+BOOKING_FOR_DEFAULT = "0"
+
+
+def booking_for_label(value: str) -> str:
+    for choice in BOOKING_FOR_CHOICES:
+        if choice["value"] == str(value):
+            return choice["label"]
+    return BOOKING_FOR_CHOICES[0]["label"]
+
+
+def booking_for_value(label: str) -> str:
+    for choice in BOOKING_FOR_CHOICES:
+        if choice["label"] == label:
+            return choice["value"]
+    return BOOKING_FOR_DEFAULT
+
+
+# Group booking. #members offers 2–5 people including the primary applicant, so
+# there are at most four extra member forms to fill in.
+GROUP_MEMBER_MAX = 5
+GROUP_COUNT_CHOICES = [str(n) for n in range(2, GROUP_MEMBER_MAX + 1)]
+GROUP_COUNT_DEFAULT = "2"
+
+# #appointmentmethod — how the group's slots relate to each other.
+APPOINTMENT_METHOD_CHOICES = [
+    {"value": "1", "label": "Same time"},
+    {"value": "2", "label": "Consecutive time slots"},
+    {"value": "3", "label": "Next available slots"},
+    {"value": "4", "label": "Select one by one"},
+]
+GROUP_METHOD_DEFAULT = "1"
+
+
+def method_label(value: str) -> str:
+    for choice in APPOINTMENT_METHOD_CHOICES:
+        if choice["value"] == str(value):
+            return choice["label"]
+    return APPOINTMENT_METHOD_CHOICES[0]["label"]
+
+
+def method_value(label: str) -> str:
+    for choice in APPOINTMENT_METHOD_CHOICES:
+        if choice["label"] == label:
+            return choice["value"]
+    return GROUP_METHOD_DEFAULT
+
+
+def gender_label(value: str) -> str:
+    for choice in GENDER_CHOICES:
+        if choice["value"] == str(value):
+            return choice["label"]
+    return "Male"
+
+
+def gender_value(label: str) -> str:
+    for choice in GENDER_CHOICES:
+        if choice["label"] == label:
+            return choice["value"]
+    return "2"
+
+
+def clamp_group_count(raw) -> int:
+    try:
+        return max(2, min(GROUP_MEMBER_MAX, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return int(GROUP_COUNT_DEFAULT)
+
 def normalize_date(raw: str, field: str) -> str:
     value = (raw or "").strip()
     iso = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", value)
@@ -389,9 +466,22 @@ class App(tk.Tk):
         self._lock = threading.Lock()
         self._pulse = None
 
+        # Opened before anything else can print, and kept open for the life of
+        # the window: the activity panel below is not a log, it dies with the
+        # process. capture_streams=True also catches tracebacks, which never go
+        # through self.log() at all.
+        self._session_log = bot.start_session_log(capture_streams=True)
+
         self.apply_theme()
         self.build_ui()
         self.load_settings()
+
+        if self._session_log:
+            self.log(f"Session log: {self._session_log}")
+        else:
+            self.log("Could not open a session log file - continuing without one.")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def apply_theme(self):
         """
@@ -443,6 +533,22 @@ class App(tk.Tk):
                   indicatorcolor=[("selected", PALETTE["primary"]),
                                   ("!selected", "#ffffff")])
 
+        # One tab per group member. A notebook rather than a stack of cards so
+        # four people's details cost the same vertical space as one.
+        style.configure("Group.TNotebook", background=PALETTE["card"],
+                        bordercolor=PALETTE["border"], borderwidth=1,
+                        tabmargins=(0, 2, 0, 0))
+        style.configure("Group.TNotebook.Tab", background=PALETTE["sunken"],
+                        foreground=PALETTE["muted"], font=FONT_LABEL,
+                        padding=(10, 5), borderwidth=1,
+                        bordercolor=PALETTE["border"])
+        style.map("Group.TNotebook.Tab",
+                  background=[("selected", PALETTE["primary"]),
+                              ("active", PALETTE["hover"])],
+                  foreground=[("selected", "#ffffff"),
+                              ("active", PALETTE["primary"])],
+                  expand=[("selected", (0, 0, 0, 0))])
+
         style.configure("Vertical.TScrollbar", background=PALETTE["border"],
                         troughcolor=PALETTE["page"], bordercolor=PALETTE["page"],
                         arrowcolor=PALETTE["muted"], relief="flat")
@@ -465,6 +571,8 @@ class App(tk.Tk):
         self.build_account_card(left_frame)
         self.build_applicant_card(left_frame)
         self.build_search_card(left_frame)
+        # Directly under the Booking as dropdowns that reveal it.
+        self.build_group_card(left_frame)
         self.build_action_bar(left_frame)
 
     def build_header(self):
@@ -600,7 +708,7 @@ class App(tk.Tk):
         self.nationality_var = tk.StringVar()
         self._entry(card, 6, 0, "Nationality", self.nationality_var)
         self.city_var = tk.StringVar(value="islamabad")
-        self._combo(card, 6, 1, "City (VAC)", self.city_var, ["islamabad", "lahore"])
+        self._combo(card, 6, 1, "City (VAC)", self.city_var, VAC_CHOICES)
         self.city_var.trace_add("write", self.update_appointment_types_ui)
 
     def build_search_card(self, parent):
@@ -629,7 +737,8 @@ class App(tk.Tk):
         tk.Label(card, text="APPOINTMENT TYPES", bg=PALETTE["card"],
                  fg=PALETTE["muted"], font=FONT_LABEL).grid(
             row=4, column=0, columnspan=2, sticky="w")
-        tk.Label(card, text="Untick a weekday to skip it for that type.",
+        tk.Label(card, text="Untick a weekday to skip it for that type. "
+                            "“Booking as” picks Individual or Group per type.",
                  bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(1, 6))
 
@@ -638,11 +747,123 @@ class App(tk.Tk):
 
         self.type_vars = {}
         self.weekday_vars = {}
+        self.booking_for_vars = {}
         self.day_count_labels = {}
         self.current_appointment_choices = []
 
+    def build_group_card(self, parent):
+        """
+        Everything a Group (Family/Traveler) booking needs: how many people,
+        how their slots relate, and one form per extra person.
+
+        Hidden unless some appointment type is set to Group — a single-applicant
+        scan should not have to scroll past four empty member forms. The forms
+        themselves are built once here and only shown or hidden afterwards, so
+        dropping the member count and raising it again does not lose what was
+        typed into the tabs that disappeared.
+        """
+        body = make_card(parent, "Group booking")
+        self.group_card = body.master       # make_card returns the panel's body
+        body.columnconfigure(0, weight=1, uniform="f")
+        body.columnconfigure(1, weight=1, uniform="f")
+
+        self.group_count_var = tk.StringVar(value=GROUP_COUNT_DEFAULT)
+        self._combo(body, 0, 0, "People in group", self.group_count_var,
+                    GROUP_COUNT_CHOICES)
+        self.group_method_var = tk.StringVar(value=method_label(GROUP_METHOD_DEFAULT))
+        self._combo(body, 0, 1, "Allocation method", self.group_method_var,
+                    [m["label"] for m in APPOINTMENT_METHOD_CHOICES])
+
+        self.group_method_hint = tk.Label(
+            body, text="", bg=PALETTE["card"], fg=PALETTE["muted"],
+            font=FONT_SMALL, justify="left", wraplength=336)
+        self.group_method_hint.grid(row=2, column=0, columnspan=2, sticky="w",
+                                    pady=(0, 8))
+
+        tk.Label(body, text="Member 1 is the primary applicant from the card "
+                            "above. Fill in one tab per extra person — the "
+                            "portal checks every row before it will search.",
+                 bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL,
+                 justify="left", wraplength=336).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        self.group_notebook = ttk.Notebook(body, style="Group.TNotebook")
+        self.group_notebook.grid(row=4, column=0, columnspan=2, sticky="ew")
+
+        self.group_member_vars = []
+        self.group_member_tabs = []
+        for _ in range(2, GROUP_MEMBER_MAX + 1):
+            tab = tk.Frame(self.group_notebook, bg=PALETTE["card"],
+                           padx=10, pady=10)
+            tab.columnconfigure(0, weight=1, uniform="g")
+            tab.columnconfigure(1, weight=1, uniform="g")
+
+            fields = {
+                "firstname":   tk.StringVar(),
+                "surname":     tk.StringVar(),
+                "dob":         tk.StringVar(),
+                "passport":    tk.StringVar(),
+                "expiry":      tk.StringVar(),
+                "gender":      tk.StringVar(value=gender_label("2")),
+                "nationality": tk.StringVar(value=bot.APPLICANT_NATIONALITY_TEXT),
+            }
+            self._entry(tab, 0, 0, "First name", fields["firstname"])
+            self._entry(tab, 0, 1, "Surname", fields["surname"])
+            self._entry(tab, 2, 0, "Date of birth", fields["dob"])
+            self._entry(tab, 2, 1, "Passport number", fields["passport"])
+            self._entry(tab, 4, 0, "Passport expiry", fields["expiry"])
+            self._combo(tab, 4, 1, "Gender", fields["gender"],
+                        [g["label"] for g in GENDER_CHOICES])
+            self._entry(tab, 6, 0, "Nationality", fields["nationality"])
+
+            self.group_member_vars.append(fields)
+            self.group_member_tabs.append(tab)
+
+        self.group_count_var.trace_add("write", self._sync_group_members)
+        self.group_method_var.trace_add("write", self._sync_group_members)
+        self._sync_group_members()
+
+        # Built visible by make_card; the type list decides whether it stays.
+        self.group_card.pack_forget()
+
+    METHOD_HINTS = {
+        "1": "Everyone gets the same slot. Nothing is booked unless one slot "
+             "fits the whole group.",
+        "2": "Back-to-back slots, one after another.",
+        "3": "The earliest slots available, not necessarily together.",
+        "4": "A slot picked separately for each person.",
+    }
+
+    def _sync_group_members(self, *args):
+        """Shows one tab per extra member and explains the chosen method."""
+        if not hasattr(self, "group_notebook"):
+            return
+
+        count = clamp_group_count(self.group_count_var.get())
+        for index, tab in enumerate(self.group_member_tabs, start=2):
+            if index <= count:
+                self.group_notebook.add(tab, text=f"Member {index}")
+            elif str(tab) in self.group_notebook.tabs():
+                self.group_notebook.hide(tab)
+
+        self.group_method_hint.config(
+            text=self.METHOD_HINTS.get(method_value(self.group_method_var.get()), ""))
+
+    def _sync_group_card(self, *args):
+        """Reveals the Group card once any appointment type asks for it."""
+        if not hasattr(self, "group_card") or not hasattr(self, "action_bar"):
+            return
+
+        wanted = any(booking_for_value(var.get()) == "1"
+                     for var in self.booking_for_vars.values())
+        shown = bool(self.group_card.winfo_manager())
+        if wanted and not shown:
+            self.group_card.pack(fill=tk.X, pady=(0, 10), before=self.action_bar)
+        elif not wanted and shown:
+            self.group_card.pack_forget()
+
     def build_action_bar(self, parent):
-        bar = tk.Frame(parent, bg=PALETTE["page"])
+        bar = self.action_bar = tk.Frame(parent, bg=PALETTE["page"])
         bar.pack(fill=tk.X, pady=(2, 0))
         bar.columnconfigure(0, weight=3, uniform="b")
         bar.columnconfigure(1, weight=2, uniform="b")
@@ -716,6 +937,8 @@ class App(tk.Tk):
         # the user would otherwise lose their choices just by looking at Lahore.
         previous = {value: [bit.get() for bit in bits]
                     for value, bits in self.weekday_vars.items()}
+        previous_booking = {value: var.get()
+                            for value, var in self.booking_for_vars.items()}
 
         for widget in self.types_frame.winfo_children():
             widget.destroy()
@@ -726,6 +949,7 @@ class App(tk.Tk):
 
         self.type_vars = {}
         self.weekday_vars = {}
+        self.booking_for_vars = {}
         self.day_count_labels = {}
         for r, t in enumerate(self.current_appointment_choices):
             value = t["value"]
@@ -769,7 +993,26 @@ class App(tk.Tk):
             count.pack(side=tk.LEFT, padx=(8, 0))
             self.day_count_labels[value] = count
 
+            # "Booking as" gets its own row rather than riding on the weekday
+            # line: seven toggles, the day count and a dropdown do not fit in
+            # the settings pane's width, and the dropdown was the part that got
+            # clipped. The pane scrolls, so the extra height is free.
+            booking_row = tk.Frame(block, bg=PALETTE["card"])
+            booking_row.grid(row=2, column=0, sticky="w", padx=(20, 0), pady=(4, 0))
+            tk.Label(booking_row, text="Booking as", bg=PALETTE["card"],
+                     fg=PALETTE["muted"], font=FONT_SMALL).pack(side=tk.LEFT,
+                                                                padx=(0, 6))
+            booking = tk.StringVar(
+                value=previous_booking.get(value, BOOKING_FOR_CHOICES[0]["label"]))
+            self.booking_for_vars[value] = booking
+            booking.trace_add("write", self._sync_group_card)
+            ttk.Combobox(booking_row, textvariable=booking,
+                         values=[c["label"] for c in BOOKING_FOR_CHOICES],
+                         state="readonly", style="Field.TCombobox",
+                         font=FONT_SMALL, width=11).pack(side=tk.LEFT)
+
         self.update_type_day_counts()
+        self._sync_group_card()
 
     def _paint_day_toggle(self, bit, widget):
         """Selected weekdays are filled navy; skipped ones sit back in grey."""
@@ -860,14 +1103,83 @@ class App(tk.Tk):
                     continue
                 bits = self.weekday_vars.get(saved.get("value"))
                 weekdays = saved.get("weekdays")
-                if bits is None or not isinstance(weekdays, list) or not weekdays:
-                    continue
-                for i, bit in enumerate(bits):
-                    bit.set(i in weekdays)
+                if bits is not None and isinstance(weekdays, list) and weekdays:
+                    for i, bit in enumerate(bits):
+                        bit.set(i in weekdays)
+
+                # Booking as arrived later still — absent means Individual,
+                # which is what every config written before this defaulted to.
+                booking = self.booking_for_vars.get(saved.get("value"))
+                if booking is not None:
+                    booking.set(booking_for_label(
+                        saved.get("booking_for", BOOKING_FOR_DEFAULT)))
+
+            self.load_group_settings(data)
             self.update_type_day_counts()
         except Exception as e:
             print("Failed to load config:", e)
             self.update_appointment_types_ui()
+
+    def load_group_settings(self, data):
+        """Restores the group card. Absent from a config written before group
+        support, which is a two-person default and four empty forms."""
+        self.group_count_var.set(str(clamp_group_count(
+            data.get("group_member_count", GROUP_COUNT_DEFAULT))))
+        self.group_method_var.set(method_label(
+            data.get("group_method", GROUP_METHOD_DEFAULT)))
+
+        saved_members = data.get("group_members") or []
+        for fields, saved in zip(self.group_member_vars, saved_members):
+            if not isinstance(saved, dict):
+                continue
+            for key in ("firstname", "surname", "dob", "passport",
+                        "expiry", "nationality"):
+                if saved.get(key):
+                    fields[key].set(str(saved[key]))
+            if saved.get("gender"):
+                fields["gender"].set(gender_label(saved["gender"]))
+
+    def raw_group_members(self):
+        """Every member tab exactly as typed, for persistence. No validation —
+        a half-filled tab the user is coming back to is worth keeping."""
+        return [{
+            "firstname":   fields["firstname"].get().strip(),
+            "surname":     fields["surname"].get().strip(),
+            "dob":         fields["dob"].get().strip(),
+            "passport":    fields["passport"].get().strip(),
+            "expiry":      fields["expiry"].get().strip(),
+            "gender":      gender_value(fields["gender"].get()),
+            "nationality": fields["nationality"].get().strip(),
+        } for fields in self.group_member_vars]
+
+    def collect_group_members(self, count: int):
+        """
+        Reads members 2..count off the tabs, validating as it goes.
+
+        Every field is required: these rows arrive blank on the portal, and
+        #btn-search refuses to send anything while one visible row has a gap.
+        """
+        members = []
+        for index, fields in enumerate(self.group_member_vars[:count - 1], start=2):
+            member = {
+                "firstname":   fields["firstname"].get().strip(),
+                "surname":     fields["surname"].get().strip(),
+                "passport":    fields["passport"].get().strip(),
+                "nationality": fields["nationality"].get().strip(),
+                "gender":      gender_value(fields["gender"].get()),
+            }
+            for key, name in (("firstname", "first name"),
+                              ("surname", "surname"),
+                              ("passport", "passport number"),
+                              ("nationality", "nationality")):
+                if not member[key]:
+                    raise ValueError(f"Member {index}: {name} is required.")
+            member["dob"] = normalize_date(fields["dob"].get(),
+                                           f"Member {index} date of birth")
+            member["expiry"] = normalize_date(fields["expiry"].get(),
+                                              f"Member {index} passport expiry")
+            members.append(member)
+        return members
 
     def save_settings(self, cfg):
         try:
@@ -883,7 +1195,12 @@ class App(tk.Tk):
                 "target_city": cfg["target_city"],
                 "scan_start_date": cfg["scan_start_date"],
                 "scan_end_date": cfg["scan_end_date"],
-                "appointment_types": cfg["appointment_types"]
+                "appointment_types": cfg["appointment_types"],
+                "group_member_count": cfg["group_member_count"],
+                "group_method": cfg["group_method"],
+                # Every tab, not just the ones this scan uses — dropping the
+                # count to 2 and saving should not erase members 4 and 5.
+                "group_members": self.raw_group_members(),
             }
             CONFIG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
@@ -897,6 +1214,17 @@ class App(tk.Tk):
         ("muted", ("✗",)),
     )
 
+    # Lines the bot's debug() produced already carry a clock; anything else —
+    # banners aside — gets one added on the way to disk, because "at what time"
+    # is the whole reason to keep the file.
+    _HAS_TIME = re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}\]")
+
+    @staticmethod
+    def _stamp(msg: str) -> str:
+        if App._HAS_TIME.match(msg) or not any(c.isalnum() for c in msg):
+            return msg
+        return f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+
     @classmethod
     def log_tag(cls, msg: str) -> str:
         """Severity of a log line, so the activity panel is scannable."""
@@ -906,6 +1234,9 @@ class App(tk.Tk):
         return "info"
 
     def log(self, msg):
+        # To disk first. The bot's print() is replaced while a scan runs, so
+        # this method — not stdout — is where the scan's output actually is.
+        bot.log_to_file(self._stamp(msg))
         self.log_area.config(state="normal")
         self.log_area.insert(tk.END, msg + "\n", self.log_tag(msg))
         self.log_area.see(tk.END)
@@ -1003,6 +1334,9 @@ class App(tk.Tk):
             target_city = self.city_var.get().strip().lower()
             if not target_city:
                 target_city = "islamabad"
+            # Fail here rather than after Chrome is up and the profile page is
+            # open — an unknown centre has no #vac option to sync to.
+            bot.vac_key(target_city)
                 
             dob = normalize_date(self.dob_var.get(), "Date of birth")
             expiry = normalize_date(self.expiry_var.get(), "Passport expiry")
@@ -1024,10 +1358,24 @@ class App(tk.Tk):
                 weekdays = [i for i, bit in enumerate(self.weekday_vars[t["value"]]) if bit.get()]
                 if not weekdays:
                     raise ValueError(f"{t['label']}: pick at least one weekday.")
-                chosen_types.append({"value": t["value"], "label": t["label"], "weekdays": weekdays})
+                chosen_types.append({
+                    "value": t["value"],
+                    "label": t["label"],
+                    "weekdays": weekdays,
+                    "booking_for": booking_for_value(
+                        self.booking_for_vars[t["value"]].get()),
+                })
 
             if not chosen_types:
                 raise ValueError("Pick at least one appointment type.")
+
+            # Group details are only demanded when something actually books as
+            # a group — an Individual-only scan never opens the card.
+            group_count = clamp_group_count(self.group_count_var.get())
+            group_method = method_value(self.group_method_var.get())
+            group_members = []
+            if any(t["booking_for"] == "1" for t in chosen_types):
+                group_members = self.collect_group_members(group_count)
 
             # A type whose weekdays never occur in the range would search nothing
             # and look like a hang, so catch it here rather than mid-scan.
@@ -1060,17 +1408,37 @@ class App(tk.Tk):
                 "target_city": target_city,
                 "scan_start_date": start_date_str,
                 "scan_end_date": end_date_str,
-                "appointment_types": chosen_types
+                "appointment_types": chosen_types,
+                "group_member_count": str(group_count),
+                "group_method": group_method,
+                "group_members": group_members,
             }
         except Exception as exc:
             messagebox.showerror("Validation Error", str(exc))
             return
 
         self.save_settings(cfg)
+        # Clearing the panel loses nothing now — the transcript on disk keeps
+        # every previous run in this session.
         self.log_area.config(state="normal")
         self.log_area.delete('1.0', tk.END)
         self.log_area.config(state="disabled")
-        
+
+        bot.log_to_file("\n" + "=" * 60)
+        bot.log_to_file(f"[{datetime.now().strftime('%H:%M:%S')}] SCAN STARTED — "
+                        f"{cfg['target_city']}, {cfg['scan_start_date']} to "
+                        f"{cfg['scan_end_date']}")
+        for t in cfg["appointment_types"]:
+            bot.log_to_file(f"    · {t['label']} — booking as "
+                            f"{booking_for_label(t.get('booking_for', BOOKING_FOR_DEFAULT))}, "
+                            f"weekdays {t['weekdays']}")
+        if cfg["group_members"]:
+            bot.log_to_file(
+                f"    Group: {cfg['group_member_count']} people, "
+                f"{method_label(cfg['group_method'])} "
+                f"(#appointmentmethod={cfg['group_method']})")
+        bot.log_to_file("=" * 60)
+
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.set_status("Starting…", "busy")
@@ -1196,6 +1564,16 @@ class App(tk.Tk):
             bot.SCAN_WEEKDAYS = {t["value"]: set(t.get("weekdays", []))
                                  for t in cfg["appointment_types"]
                                  if 0 < len(t.get("weekdays", [])) < 7}
+            bot.BOOKING_FOR_BY_TYPE = {
+                t["value"]: t.get("booking_for", BOOKING_FOR_DEFAULT)
+                for t in cfg["appointment_types"]}
+            bot.GROUP_MEMBER_COUNT = str(cfg.get("group_member_count",
+                                                 GROUP_COUNT_DEFAULT))
+            bot.GROUP_APPOINTMENT_METHOD = str(cfg.get("group_method",
+                                                       GROUP_METHOD_DEFAULT))
+            # Members 2..N. Row 0 on the portal is the primary applicant and is
+            # filled from the APPLICANT_* settings above, never from here.
+            bot.GROUP_MEMBERS = list(cfg.get("group_members") or [])
 
             bot.print = patched_print
             bot.input = patched_input
@@ -1242,6 +1620,19 @@ class App(tk.Tk):
         self.stop_btn.config(state="disabled")
         self.confirm_btn.config(state="disabled")
         self.set_status("Stopped", "stopped")
+        # The file stays open — a second run in the same window appends to the
+        # same transcript rather than starting a new one.
+        bot.log_to_file(f"[{datetime.now().strftime('%H:%M:%S')}] SCAN STOPPED")
+        bot.log_to_file("=" * 60 + "\n")
+
+    def _on_close(self):
+        """Winds the scan down and closes the transcript before the window goes."""
+        if self._thread is not None and self._thread.is_alive():
+            self._stop.set()
+            self._continue.set()
+            self._thread.join(timeout=5)
+        bot.close_session_log("closed with the app window")
+        self.destroy()
 
     def stop_scan(self):
         self._stop.set()

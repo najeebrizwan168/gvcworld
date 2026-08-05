@@ -5,6 +5,7 @@ import json
 import time
 import random
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -34,6 +35,48 @@ USER_PASS = "980Aa0330"
 APPLICANT_FIRST_NAME = ""
 APPLICANT_SURNAME = ""
 TARGET_CITY = "islamabad"
+
+# Every option the profile page's #vac select offers (profile-page-structure.md
+# §2 "Select option values"). Keys are what the GUI stores in TARGET_CITY.
+VAC_IDS = {
+    "islamabad": "137",
+    "lahore": "138",
+    "verification": "140",
+}
+
+# Display names, used for log lines and for confirming the select2 widget
+# actually repainted after a change. TARGET_CITY.capitalize() was fine while
+# every centre was one word; "Verification Office" is not.
+VAC_LABELS = {
+    "islamabad": "Islamabad",
+    "lahore": "Lahore",
+    "verification": "Verification Office",
+}
+
+# What a user (or an older config file) might have typed for the same centre.
+VAC_ALIASES = {
+    "verification office": "verification",
+    "verification-office": "verification",
+    "verificationoffice": "verification",
+}
+
+
+def vac_key(city: str) -> str:
+    """Normalises a city string to a VAC_IDS key. Raises on anything unknown —
+    silently defaulting would scan the wrong centre."""
+    name = (city or "").strip().lower()
+    name = VAC_ALIASES.get(name, name)
+    if name not in VAC_IDS:
+        raise ValueError(f"Unknown target city: {city!r}")
+    return name
+
+
+def vac_id_for(city: str) -> str:
+    return VAC_IDS[vac_key(city)]
+
+
+def vac_label(city: str) -> str:
+    return VAC_LABELS[vac_key(city)]
 APPLICANT_DOB = "04/07/2006"                # dd/mm/yyyy
 APPLICANT_PASSPORT = "646446656"
 APPLICANT_PASSPORT_EXPIRY = "04/07/2036"    # dd/mm/yyyy
@@ -55,10 +98,97 @@ APPOINTMENT_TYPES_LAHORE = [
     ("26", "Long-Term Type D (Seasonal/Dependent Employment)"),
 ]
 
+# The Verification Office renders exactly one type — the option list is built
+# server-side per VAC (book-appointment-GROUP-structure.md §0), so Islamabad's
+# ids are not valid here.
+APPOINTMENT_TYPES_VERIFICATION = [
+    ("24", "Document Verification"),
+]
+
 APPOINTMENT_TYPES = APPOINTMENT_TYPES_ISLAMABAD.copy()
 
+APPOINTMENT_TYPES_BY_VAC = {
+    "islamabad": APPOINTMENT_TYPES_ISLAMABAD,
+    "lahore": APPOINTMENT_TYPES_LAHORE,
+    "verification": APPOINTMENT_TYPES_VERIFICATION,
+}
+
 def get_appointment_types(city: str):
-    return APPOINTMENT_TYPES_LAHORE if city.strip().lower() == "lahore" else APPOINTMENT_TYPES_ISLAMABAD
+    """Each centre renders its own #type list. Islamabad's doubles as the
+    fallback for a city string we do not recognise."""
+    try:
+        return APPOINTMENT_TYPES_BY_VAC[vac_key(city)]
+    except ValueError:
+        return APPOINTMENT_TYPES_ISLAMABAD
+
+
+# ── "Booking as" — #bookingfor (book-appointment-structure.md §4) ────────────
+# Required on the appointment form. Selecting Group reveals #membersDiv and
+# #appointmentmethodDiv, both of which arrive empty and have to be filled or
+# #btn-search fails its client-side validation and never hits the network.
+BOOKING_FOR_INDIVIDUAL = "0"
+BOOKING_FOR_GROUP = "1"
+BOOKING_FOR_LABELS = {
+    BOOKING_FOR_INDIVIDUAL: "Individual",
+    BOOKING_FOR_GROUP: "Group (Family/Traveler)",
+}
+DEFAULT_BOOKING_FOR = BOOKING_FOR_INDIVIDUAL
+
+# Per-appointment-type override, keyed by type value — the GUI fills this in.
+# A type that is absent books as DEFAULT_BOOKING_FOR.
+BOOKING_FOR_BY_TYPE = {}
+
+
+def booking_for_for_type(type_value: str) -> str:
+    """The #bookingfor value this appointment type should be searched under."""
+    value = str(BOOKING_FOR_BY_TYPE.get(type_value, DEFAULT_BOOKING_FOR))
+    return value if value in BOOKING_FOR_LABELS else DEFAULT_BOOKING_FOR
+
+
+# ── Group booking (book-appointment-GROUP-structure.md) ──────────────────────
+# Only read when Booking as = Group. #members offers 2–5; setting it is what
+# clones the applicant rows, and #appointmentmethod decides how their slots
+# relate. Both live behind `.hidden` until #bookingfor = 1, and #btn-search
+# validates both — plus every visible applicant row — before it will put
+# anything on the wire.
+GROUP_MEMBER_COUNT = "2"                    # 2–5, total people including the primary
+GROUP_APPOINTMENT_METHOD = "1"              # 1 = Same time
+
+APPOINTMENT_METHOD_LABELS = {
+    "1": "Same time",
+    "2": "Consecutive time slots",
+    "3": "Next available slots",
+    "4": "Select one by one",
+}
+
+# Members 2..N only. Row 0 is the primary applicant and always comes from the
+# APPLICANT_* settings, so this list holds at most four people. Each entry:
+# {surname, firstname, dob, passport, expiry, gender, nationality}.
+GROUP_MEMBERS = []
+
+# Cloning runs off #members' change handler, so the rows appear asynchronously.
+GROUP_ROW_RENDER_SECONDS = 10
+
+
+def group_member_count() -> int:
+    """Total people in the group, clamped to what #members actually offers."""
+    try:
+        count = int(str(GROUP_MEMBER_COUNT))
+    except (TypeError, ValueError):
+        return 2
+    return max(2, min(5, count))
+
+
+def group_appointment_method() -> str:
+    value = str(GROUP_APPOINTMENT_METHOD)
+    return value if value in APPOINTMENT_METHOD_LABELS else "1"
+
+
+def group_is_configured() -> bool:
+    """True when at least one appointment type will be searched as a group."""
+    return any(booking_for_for_type(value) == BOOKING_FOR_GROUP
+               for value, _ in APPOINTMENT_TYPES)
+
 
 SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
 SCAN_END_DATE_STR = ""    # format: dd/mm/yyyy
@@ -159,6 +289,13 @@ SESSION_FILE = PERSIST_DIR / "gvc_session.json"
 # interrupted run resumes on the exact date it was interrupted on.
 SCAN_STATE_FILE = PERSIST_DIR / "gvc_scan_state.json"
 
+# One plain-text transcript per run, kept beside everything else. The GUI
+# replaces this module's print() with one that only reaches the Tk widget, so
+# without an explicit sink the on-screen log is the only copy and it dies with
+# the window — which is exactly the log you want after an overnight run.
+LOG_DIR = PERSIST_DIR / "logs"
+LOG_RETENTION = 20          # session files kept; older ones are pruned on start
+
 # Cookie names that indicate a live portal session. Substring match, lowercased
 # — the portal is ASP.NET today but the check shouldn't be brittle about it.
 SESSION_COOKIE_HINTS = ("session", "sessid", "asp.net", "auth", "token",
@@ -204,6 +341,147 @@ class RateLimitRestart(Exception):
     def __init__(self, message, retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+# ============================================================================
+# SESSION LOG — live transcript on disk
+# ============================================================================
+# Opened once per run and appended to line by line, flushed on every write so
+# the file is complete even if the process is killed. Writes come from the scan
+# thread, the Tk main thread and the stream tee, hence the lock.
+_session_log = None
+_session_log_path = None
+_log_lock = threading.Lock()
+_captured_streams = None        # (stdout, stderr) as they were before the tee
+
+
+def session_log_path():
+    """Path of the transcript for this run, or None if logging never started."""
+    return _session_log_path
+
+
+def _prune_old_logs():
+    """Keeps the newest LOG_RETENTION transcripts. A scanner that runs for weeks
+    should not quietly fill a disk with its own diary."""
+    try:
+        files = sorted(LOG_DIR.glob("session_*.log"),
+                       key=lambda p: p.name, reverse=True)
+        for stale in files[LOG_RETENTION:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def start_session_log(capture_streams=False):
+    """
+    Opens this run's transcript and returns its path (None if it can't be
+    written — logging must never be the thing that stops a scan).
+
+    `capture_streams` also mirrors stdout/stderr into it, which is what catches
+    tracebacks and anything printed by a library. The GUI passes True; it feeds
+    its own lines in through log_to_file() because its patched print() never
+    reaches stdout at all.
+    """
+    global _session_log, _session_log_path
+
+    with _log_lock:
+        if _session_log is not None:
+            return _session_log_path
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = LOG_DIR / f"session_{stamp}.log"
+            handle = open(path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            return None
+        _session_log = handle
+        _session_log_path = path
+
+    _prune_old_logs()
+    log_to_file("=" * 60)
+    log_to_file(f"GVCW scanner session log — started "
+                f"{datetime.now().isoformat(timespec='seconds')}")
+    log_to_file("=" * 60)
+
+    if capture_streams:
+        global _captured_streams
+        _captured_streams = (sys.stdout, sys.stderr)
+        sys.stdout = _StreamTee(sys.stdout)
+        sys.stderr = _StreamTee(sys.stderr)
+    return _session_log_path
+
+
+def log_to_file(text, raw=False):
+    """Appends a line to the transcript. `raw` writes the text exactly as given
+    (used by the stream tee, whose chunks carry their own newlines)."""
+    if _session_log is None or text is None:
+        return
+    with _log_lock:
+        handle = _session_log
+        if handle is None:
+            return
+        try:
+            handle.write(text if raw else f"{text}\n")
+            handle.flush()
+        except (OSError, ValueError):
+            # Disk full, or the handle was closed from another thread mid-write.
+            pass
+
+
+def close_session_log(reason="closed"):
+    """Closes the transcript and unhooks the streams. Safe to call twice."""
+    global _session_log, _session_log_path, _captured_streams
+
+    log_to_file(f"--- session log {reason} "
+                f"{datetime.now().isoformat(timespec='seconds')} ---")
+    with _log_lock:
+        handle, _session_log = _session_log, None
+        _session_log_path = None
+
+    if _captured_streams is not None:
+        # Only put back what we replaced — anything installed on top of our tee
+        # since then belongs to someone else and is left alone.
+        original_out, original_err = _captured_streams
+        if isinstance(sys.stdout, _StreamTee):
+            sys.stdout = original_out
+        if isinstance(sys.stderr, _StreamTee):
+            sys.stderr = original_err
+        _captured_streams = None
+
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+class _StreamTee:
+    """Mirrors a stream into the session log without swallowing it."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        if self._stream is not None:
+            try:
+                self._stream.write(data)
+            except Exception:
+                pass
+        log_to_file(data, raw=True)
+        return len(data)
+
+    def flush(self):
+        if self._stream is not None:
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
 
 
 # ============================================================================
@@ -551,6 +829,13 @@ def scan_signature() -> str:
         "|".join(v for v, _ in APPOINTMENT_TYPES),
         "|".join(f"{k}:{','.join(str(d) for d in sorted(v))}"
                  for k, v in sorted(SCAN_WEEKDAYS.items())),
+        # Individual and Group are different queries against the same dates, so
+        # a checkpoint taken under one must not resume under the other.
+        "|".join(f"{v}={booking_for_for_type(v)}" for v, _ in APPOINTMENT_TYPES),
+        # Likewise a group of three and a group of four are different searches,
+        # and so are two allocation methods over the same three people.
+        (f"{group_member_count()}/{group_appointment_method()}"
+         if group_is_configured() else "-"),
     ]
     return hashlib.sha1("~".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -1347,12 +1632,328 @@ def count_dates_to_scan() -> int:
     return sum(len(dates_for_type(v, start_date, end_date)) for v, _ in APPOINTMENT_TYPES)
 
 
+def select_booking_for(driver, type_value: str):
+    """
+    Sets "Booking as" (#bookingfor) for this appointment type.
+
+    Called after #type, never before: changing the appointment type re-renders
+    this block, so setting it first would be undone. Group additionally reveals
+    #membersDiv and #appointmentmethodDiv and clones one applicant row per
+    person, all of which #btn-search validates before it will put anything on
+    the wire — _prepare_group_booking() below sets them up.
+
+    Returns the value that ended up selected.
+    """
+    wanted = booking_for_for_type(type_value)
+    label = BOOKING_FOR_LABELS[wanted]
+
+    current = driver.execute_script(
+        "var el = document.getElementById('bookingfor'); return el ? el.value : null;")
+    if current is None:
+        debug("⚠ #bookingfor is not on this page — leaving Booking as untouched.")
+        return None
+
+    if str(current) == wanted:
+        debug(f"Booking as: {label} (already set).")
+    else:
+        debug(f"Setting Booking as: {label} (#bookingfor={wanted})...")
+        human_select_dropdown_by_value(driver, "#bookingfor", wanted)
+        random_pause(0.6, 1.2)
+
+        applied = driver.execute_script(
+            "var el = document.getElementById('bookingfor'); return el ? el.value : null;")
+        if str(applied) != wanted:
+            raise Exception(
+                f"Could not set Booking as to {label}: #bookingfor reads {applied!r}")
+
+    if wanted == BOOKING_FOR_GROUP:
+        _prepare_group_booking(driver)
+    return wanted
+
+
+# Counts the applicant rows the user can actually see. Filtering on `.hidden`
+# rather than on #secondTr by id is what the structure doc recommends — it keeps
+# working if the app ever adds another hidden row.
+GROUP_ROW_COUNT_JS = """
+    return Array.prototype.filter.call(
+        document.querySelectorAll('#groupBody tr'),
+        function (tr) { return !tr.classList.contains('hidden'); }).length;
+"""
+
+
+def _prepare_group_booking(driver):
+    """
+    Brings the form into group mode and fills every extra applicant row.
+
+    The order is the one in book-appointment-GROUP-structure.md §7 and it is not
+    interchangeable: #members has to go first because setting it is what clones
+    the rows, the clones render asynchronously so they have to be waited for,
+    and only then can the rows be written to.
+    """
+    count = group_member_count()
+    method = group_appointment_method()
+    debug(f"Group booking: {count} people, allocation method {method} "
+          f"({APPOINTMENT_METHOD_LABELS[method]}).")
+
+    if not _set_group_select(driver, "members", str(count)):
+        debug("⚠ #members is missing or does not offer that many people — the "
+              "portal may not have switched into group mode. Leaving the "
+              "applicant rows alone.")
+        return
+
+    rendered = _wait_for_group_rows(driver, count)
+    if rendered < count:
+        debug(f"⚠ Only {rendered} of {count} applicant rows rendered within "
+              f"{GROUP_ROW_RENDER_SECONDS}s. Filling the ones that are there.")
+
+    if not _set_group_select(driver, "appointmentmethod", method):
+        debug("⚠ #appointmentmethod is missing — leaving the allocation method "
+              "as the portal set it.")
+
+    fill_group_member_rows(driver, count)
+    report_group_row_gaps(driver)
+
+
+def _set_group_select(driver, element_id: str, value: str) -> bool:
+    """
+    Sets one of the two group selects and confirms it took.
+
+    Both are select2-backed, so the change has to reach jQuery or the row
+    cloning and the reveal handlers never run — which is what
+    human_select_dropdown_by_value already does. Returns False when the element
+    or the option is absent, so the caller can say so rather than crash.
+    """
+    exists = driver.execute_script("""
+        var el = document.getElementById(arguments[0]);
+        if (!el) { return false; }
+        var wanted = arguments[1];      // hoisted: `arguments` is not the
+        return Array.prototype.some.call(el.options, function (o) {
+            return o.value === wanted;  // outer one inside this callback
+        });
+    """, element_id, str(value))
+    if not exists:
+        return False
+
+    current = driver.execute_script(
+        "return document.getElementById(arguments[0]).value;", element_id)
+    if str(current) == str(value):
+        return True
+
+    human_select_dropdown_by_value(driver, f"#{element_id}", str(value))
+    random_pause(0.3, 0.6)
+
+    applied = driver.execute_script(
+        "return document.getElementById(arguments[0]).value;", element_id)
+    if str(applied) != str(value):
+        raise Exception(
+            f"Could not set #{element_id} to {value} — it reads {applied!r}")
+    return True
+
+
+def _wait_for_group_rows(driver, expected: int, timeout=None) -> int:
+    """Polls until the clones have rendered. Reading the rows straight after
+    setting #members finds only the original two."""
+    if timeout is None:
+        timeout = GROUP_ROW_RENDER_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            seen = driver.execute_script(GROUP_ROW_COUNT_JS) or 0
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+            seen = 0
+        if seen >= expected or time.monotonic() >= deadline:
+            return seen
+        time.sleep(0.25)
+
+
+# Writes members 2..N into their own rows. Everything is reached through
+# [name="applicants[][…]"] scoped to a row: the clones reuse the template's ids
+# (#ex_surname and friends), so an id lookup lands in the hidden #secondTr and
+# the data goes nowhere the portal will submit.
+FILL_GROUP_ROWS_JS = r"""
+var people = arguments[0];
+var report = [];
+
+var rows = Array.prototype.filter.call(
+    document.querySelectorAll('#groupBody tr'),
+    function (tr) { return !tr.classList.contains('hidden'); });
+
+function field(row, name) {
+    return row.querySelector('[name="applicants[][' + name + ']"]');
+}
+
+function setText(el, value) {
+    if (!el) { return 'missing'; }
+    el.value = value;
+    if (window.jQuery) { window.jQuery(el).val(value); }
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return el.value === value ? 'ok' : 'rejected';
+}
+
+function setByValue(el, value) {
+    if (!el) { return 'missing'; }
+    var offered = Array.prototype.some.call(el.options, function (o) {
+        return o.value === value;
+    });
+    if (!offered) { return 'no such option'; }
+    el.value = value;
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    if (window.jQuery && window.jQuery(el).data('select2')) {
+        window.jQuery(el).trigger('change');
+    }
+    return el.value === value ? 'ok' : 'rejected';
+}
+
+function setByText(el, text) {
+    if (!el) { return 'missing'; }
+    var wanted = String(text).trim().toUpperCase();
+    var match = null;
+    for (var i = 0; i < el.options.length; i++) {
+        var label = el.options[i].text.trim().toUpperCase();
+        if (label === wanted) { match = el.options[i]; break; }
+        if (!match && label.indexOf(wanted) !== -1) { match = el.options[i]; }
+    }
+    if (!match) { return 'no such option'; }
+    return setByValue(el, match.value);
+}
+
+for (var i = 0; i < people.length; i++) {
+    // rows[0] is the primary applicant — fill_applicant_fields() owns that one.
+    var row = rows[i + 1];
+    var entry = { member: i + 2 };
+    if (!row) { entry.row = 'missing'; report.push(entry); continue; }
+
+    var person = people[i];
+    entry.row         = row.id || '(unnamed)';
+    entry.surname     = setText(field(row, 'surname'), person.surname);
+    entry.firstname   = setText(field(row, 'firstname'), person.firstname);
+    entry.passport    = setText(field(row, 'passportnumber'), person.passport);
+    entry.dob         = setText(field(row, 'dateofbirth'), person.dob);
+    entry.expiry      = setText(field(row, 'traveldocumentvaliduntil'), person.expiry);
+    entry.gender      = setByValue(field(row, 'gender[id]'), person.gender);
+    entry.nationality = setByText(field(row, 'nationality[id]'), person.nationality);
+    report.push(entry);
+}
+
+// A datepicker panel can pop open on focus and swallow the next click.
+if (window.jQuery && window.jQuery.datepicker) {
+    try { window.jQuery.datepicker._hideDatepicker(); } catch (e) {}
+}
+return report;
+"""
+
+
+def _group_member_payload(member: dict) -> dict:
+    """Normalises a configured member into the seven fields a row needs."""
+    def text(key, fallback=""):
+        return str(member.get(key) or "").strip() or fallback
+
+    return {
+        "surname":     text("surname"),
+        "firstname":   text("firstname"),
+        "passport":    text("passport"),
+        "dob":         text("dob"),
+        "expiry":      text("expiry"),
+        "gender":      text("gender", APPLICANT_GENDER_VALUE),
+        "nationality": text("nationality", APPLICANT_NATIONALITY_TEXT),
+    }
+
+
+def fill_group_member_rows(driver, count: int):
+    """
+    Writes members 2..count into the cloned rows.
+
+    Row 0 is the primary applicant and is left to fill_applicant_fields, so a
+    group of N needs N-1 configured people here. Nothing is logged but the
+    per-field outcome — passport numbers and dates of birth do not belong in a
+    transcript that gets shared when something goes wrong.
+    """
+    wanted = max(0, count - 1)
+    people = [_group_member_payload(m) for m in GROUP_MEMBERS[:wanted]]
+
+    if len(people) < wanted:
+        debug(f"⚠ Group is set to {count} people but only {len(people) + 1} have "
+              f"details configured. {wanted - len(people)} row(s) will stay blank "
+              "and Search will refuse to run.")
+    if not people:
+        return
+
+    report = driver.execute_script(FILL_GROUP_ROWS_JS, people) or []
+    for entry in report:
+        member = f"Member {entry.get('member')}"
+        if entry.get("row") == "missing":
+            debug(f"⚠ {member}: no row on the page to fill.")
+            continue
+        problems = [f"{key}: {state}" for key, state in entry.items()
+                    if key not in ("member", "row") and state != "ok"]
+        if problems:
+            debug(f"⚠ {member} (row {entry['row']}) — {', '.join(problems)}")
+        else:
+            debug(f"{member} (row {entry['row']}): filled.")
+
+
+# Reports which visible row still has an empty required cell. Named fields only,
+# and it returns the field names rather than their contents.
+GROUP_ROW_GAPS_JS = r"""
+var rows = Array.prototype.filter.call(
+    document.querySelectorAll('#groupBody tr'),
+    function (tr) { return !tr.classList.contains('hidden'); });
+
+var names = ['surname', 'firstname', 'dateofbirth', 'passportnumber',
+             'traveldocumentvaliduntil', 'gender[id]', 'nationality[id]'];
+var gaps = [];
+
+for (var i = 0; i < rows.length; i++) {
+    var blank = [];
+    for (var n = 0; n < names.length; n++) {
+        var el = rows[i].querySelector('[name="applicants[][' + names[n] + ']"]');
+        if (!el) { blank.push(names[n] + ' (no field)'); continue; }
+        if (!String(el.value || '').trim()) { blank.push(names[n]); }
+    }
+    if (blank.length) {
+        gaps.push({ member: i + 1, row: rows[i].id || '(primary)', blank: blank });
+    }
+}
+return { rows: rows.length, gaps: gaps };
+"""
+
+
+def report_group_row_gaps(driver) -> bool:
+    """
+    Logs any visible applicant row that is still incomplete.
+
+    #btn-search validates every visible row client-side and shows "Please check
+    the form fields again" without sending a request, which is indistinguishable
+    from a slow portal. Naming the row and the field turns that dead end into
+    something actionable. Returns True when every row is complete.
+    """
+    try:
+        result = driver.execute_script(GROUP_ROW_GAPS_JS) or {}
+    except WebDriverException as err:
+        _reraise_if_dead(err)
+        return True
+
+    gaps = result.get("gaps") or []
+    if not gaps:
+        debug(f"All {result.get('rows', '?')} applicant row(s) are complete.")
+        return True
+
+    for gap in gaps:
+        debug(f"⚠ Member {gap.get('member')} (row {gap.get('row')}) is missing: "
+              f"{', '.join(gap.get('blank', []))}")
+    debug("Search validates every visible row before it sends anything, so it "
+          "will refuse until those are filled in.")
+    return False
+
+
 def select_appointment_type(driver, type_value: str, type_label: str):
     """
-    Picks the appointment type and handles the Travel Purpose dropdown it can
-    reveal. Split out of the scan so an in-place reload can restore it — a
-    reload resets #type back to its default, and scanning on would silently
-    query the wrong category.
+    Picks the appointment type, sets "Booking as", and handles the Travel
+    Purpose dropdown the type can reveal. Split out of the scan so an in-place
+    reload can restore it — a reload resets #type back to its default, and
+    scanning on would silently query the wrong category.
     """
     debug(f"Selecting appointment type: {type_label}...")
     if type_value == "Premium Lounge":
@@ -1378,6 +1979,9 @@ def select_appointment_type(driver, type_value: str, type_label: str):
                 random_pause(0.5, 1.0)
     except Exception:
         pass
+
+    # Last, and never earlier: #type re-renders this block when it changes.
+    select_booking_for(driver, type_value)
 
 
 def recover_stalled_page(driver, type_value: str, type_label: str):
@@ -1418,6 +2022,7 @@ def scan_dates_for_type(driver, type_value: str, type_label: str,
     print("\n" + "=" * 60)
     print(f"[SCANNING] Appointment Type: {type_label}")
     print(f"[SCANNING] Type value: {type_value}")
+    print(f"[SCANNING] Booking as: {BOOKING_FOR_LABELS[booking_for_for_type(type_value)]}")
     print("=" * 60)
 
     select_appointment_type(driver, type_value, type_label)
@@ -1550,6 +2155,11 @@ def scan_dates_for_type(driver, type_value: str, type_label: str,
 
         if modal_visible:
             debug("⚠ Validation modal detected! Dismissing it...")
+            # In group mode this is almost always an incomplete applicant row,
+            # and the modal itself does not say which one. The DOM still holds
+            # the answer, so read it out before clearing the modal away.
+            if booking_for_for_type(type_value) == BOOKING_FOR_GROUP:
+                report_group_row_gaps(driver)
             if not dismiss_modal_if_any(driver, timeout=5):
                 try:
                     ActionChains(driver).send_keys(Keys.ESCAPE).perform()
@@ -1626,25 +2236,24 @@ def ensure_vac(driver):
     print("[STEP] SYNCHRONIZING VAC CITY")
     print("=" * 60)
     
-    vac_map = {"islamabad": "137", "lahore": "138"}
-    target_city = TARGET_CITY.lower()
-    if target_city not in vac_map:
-        raise ValueError(f"Unknown target city: {target_city}")
-    
-    target_id = vac_map[target_city]
-    
+    target_city = vac_key(TARGET_CITY)
+    target_id = VAC_IDS[target_city]
+    target_label = VAC_LABELS[target_city]
+
     # 1. Fast pre-check: Read current VAC from the sidebar display string
     #    ("===najeeb21===  VAC:[Lahore]") — present on every authenticated page.
+    #    Matched on the key, not the label: "Verification Office" renders in the
+    #    sidebar as its full name and startswith("verification") still holds.
     try:
         sidebar_text = driver.find_element(By.TAG_NAME, "body").text
         match = re.search(r"VAC:\s*\[([^\]]+)\]", sidebar_text)
         if match and match.group(1).strip().lower().startswith(target_city):
-            debug(f"VAC already set to {target_city.capitalize()} (sidebar text match). Skipping sync.")
+            debug(f"VAC already set to {target_label} (sidebar text match). Skipping sync.")
             return False
     except Exception:
         pass # Fallback to profile page
 
-    debug(f"Checking VAC from profile page to ensure it's {target_city.capitalize()}...")
+    debug(f"Checking VAC from profile page to ensure it's {target_label}...")
     
     # 2. Get Profile URL
     try:
@@ -1676,10 +2285,11 @@ def ensure_vac(driver):
     
     current_vac = driver.execute_script("return document.getElementById('vac').value;")
     if current_vac == target_id:
-        debug(f"VAC already set to {target_city.capitalize()} (value={target_id}). Skipping sync.")
+        debug(f"VAC already set to {target_label} (value={target_id}). Skipping sync.")
         return False
-        
-    debug(f"VAC drift detected: current={current_vac}, target={target_id}. Updating profile...")
+
+    debug(f"VAC drift detected: current={current_vac}, target={target_id} "
+          f"({target_label}). Updating profile...")
     
     before_snap = driver.execute_script(snapshot_script)
     if before_snap.get("newpassword") != "" or before_snap.get("verifypassword") != "":
@@ -1701,7 +2311,10 @@ def ensure_vac(driver):
     native_val = driver.execute_script("return document.getElementById('vac').value;")
     widget_text = driver.execute_script("return document.querySelector('#vac-wrap .select2-selection__rendered').textContent;")
     
-    if native_val != target_id or target_city.capitalize() not in widget_text:
+    # Case-insensitive: the option text is the centre's full name ("Islamabad
+    # Visa Application Center for Greece", "Verification Office"), so the label
+    # is a substring of it rather than an exact match.
+    if native_val != target_id or target_label.lower() not in (widget_text or "").lower():
         raise Exception(f"VAC change failed to apply to UI widget. native: {native_val}, widget: {widget_text}")
         
     after_snap = driver.execute_script(snapshot_script)
@@ -1746,7 +2359,7 @@ def ensure_vac(driver):
     if new_vac != target_id:
         raise Exception(f"VAC save failed! Expected {target_id}, got {new_vac}")
 
-    debug(f"VAC successfully synced to {target_city.capitalize()}.")
+    debug(f"VAC successfully synced to {target_label} (value={target_id}).")
     return True
 
 
@@ -1841,14 +2454,14 @@ def open_appointment_page(driver, attempts=3):
 def assert_vac_on_appointment_page(driver):
     """Hard gate: never fall through into booking with a mismatched VAC."""
     debug("Asserting VAC is correctly set on /appointments/add...")
-    vac_map = {"islamabad": "137", "lahore": "138"}
-    expected = vac_map[TARGET_CITY.lower()]
+    expected = vac_id_for(TARGET_CITY)
 
     WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#vac")))
     loaded_vac = driver.execute_script("return document.getElementById('vac').value;")
     if loaded_vac != expected:
         raise Exception(f"FATAL: Appointment form loaded with VAC {loaded_vac}, expected {expected}")
-    debug(f"VAC gate passed — appointment form is querying {TARGET_CITY.capitalize()} ({expected}).")
+    debug(f"VAC gate passed — appointment form is querying "
+          f"{vac_label(TARGET_CITY)} ({expected}).")
 
 
 def reopen_appointment_form(driver, reason: str):
@@ -2126,6 +2739,27 @@ def main():
     print("  Selenium Undetected Chrome Runtime")
     print("  ♾️  CONTINUOUS MODE — will scan forever until you stop it")
     print("=" * 60)
+    if _session_log_path is not None:
+        print(f"  Session log: {_session_log_path}")
+    print(f"  VAC: {vac_label(TARGET_CITY)} ({vac_id_for(TARGET_CITY)})")
+    for value, label in APPOINTMENT_TYPES:
+        print(f"    · {label} — booking as "
+              f"{BOOKING_FOR_LABELS[booking_for_for_type(value)]}")
+    if group_is_configured():
+        count = group_member_count()
+        method = group_appointment_method()
+        print(f"  Group: {count} people, {APPOINTMENT_METHOD_LABELS[method]} "
+              f"(#appointmentmethod={method})")
+        print(f"    · Member 1 — the primary applicant above")
+        for index, member in enumerate(GROUP_MEMBERS[:count - 1], start=2):
+            name = " ".join(part for part in
+                            (str(member.get("firstname") or "").strip(),
+                             str(member.get("surname") or "").strip()) if part)
+            print(f"    · Member {index} — {name or '(no name configured)'}")
+        if len(GROUP_MEMBERS) < count - 1:
+            print(f"    ⚠ {count - 1 - len(GROUP_MEMBERS)} member(s) have no "
+                  f"details — Search will refuse until they are filled in.")
+    print("=" * 60)
 
     _search_interval = SEARCH_MIN_INTERVAL_SECONDS
     _last_search_at = 0.0
@@ -2310,4 +2944,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Terminal runs get the same transcript the GUI writes. The GUI opens its
+    # own before importing anything, so this is a no-op under it.
+    start_session_log(capture_streams=True)
+    try:
+        main()
+    finally:
+        close_session_log("closed on exit")
