@@ -145,6 +145,18 @@ def clamp_group_count(raw) -> int:
     except (TypeError, ValueError):
         return int(GROUP_COUNT_DEFAULT)
 
+
+# Whether every Group appointment type shares one set of member details, or
+# each carries its own. Shared is the default — the common case is one family
+# applying under one or two categories.
+GROUP_SCOPE_GLOBAL = "global"
+GROUP_SCOPE_PER_TYPE = "per_type"
+GROUP_SCOPE_DEFAULT = GROUP_SCOPE_GLOBAL
+
+# Chrome starts hidden once the scan is under way, which is what the scanner
+# has always done; the toggle exists to override that either way.
+HIDE_CHROME_DEFAULT = True
+
 def normalize_date(raw: str, field: str) -> str:
     value = (raw or "").strip()
     iso = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", value)
@@ -464,6 +476,20 @@ class App(tk.Tk):
         self._driver = None
         self._hwnd = None
         self._lock = threading.Lock()
+        # The operator's Chrome preference, and a flag for the moments the
+        # automation has to override it (a login gate needs a visible window
+        # whatever the preference says).
+        self.hide_chrome_var = tk.BooleanVar(value=HIDE_CHROME_DEFAULT)
+        self._force_visible = False
+
+        # Group forms. The shared one, plus one per appointment type created on
+        # demand; both outlive every widget rebuild.
+        self.group_state = self.new_group_state()
+        self.group_count_var = self.group_state["count"]
+        self.group_method_var = self.group_state["method"]
+        self.group_member_vars = self.group_state["members"]
+        self.type_group_states = {}
+        self.group_panel_open = {}
         self._pulse = None
 
         # Opened before anything else can print, and kept open for the life of
@@ -530,6 +556,15 @@ class App(tk.Tk):
                         focuscolor=PALETTE["card"])
         style.map("Card.TCheckbutton",
                   background=[("active", PALETTE["card"])],
+                  indicatorcolor=[("selected", PALETTE["primary"]),
+                                  ("!selected", "#ffffff")])
+
+        style.configure("Card.TRadiobutton", background=PALETTE["card"],
+                        foreground=PALETTE["text"], font=FONT_SMALL,
+                        focuscolor=PALETTE["card"])
+        style.map("Card.TRadiobutton",
+                  background=[("active", PALETTE["card"])],
+                  foreground=[("active", PALETTE["primary"])],
                   indicatorcolor=[("selected", PALETTE["primary"]),
                                   ("!selected", "#ffffff")])
 
@@ -739,66 +774,52 @@ class App(tk.Tk):
             row=4, column=0, columnspan=2, sticky="w")
         tk.Label(card, text="Untick a weekday to skip it for that type. "
                             "“Booking as” picks Individual or Group per type.",
-                 bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL).grid(
+                 bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL,
+                 justify="left", wraplength=336).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(1, 6))
 
+        # Master switch. Sits above the type list because it decides where all
+        # the group forms below it live.
+        scope = tk.Frame(card, bg=PALETTE["card"])
+        scope.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        tk.Label(scope, text="GROUP INFO", bg=PALETTE["card"],
+                 fg=PALETTE["muted"], font=FONT_LABEL).pack(anchor="w")
+        self.group_scope_var = tk.StringVar(value=GROUP_SCOPE_DEFAULT)
+        for value, text in ((GROUP_SCOPE_GLOBAL,
+                             "Use the same group info for all types"),
+                            (GROUP_SCOPE_PER_TYPE,
+                             "Configure separate group info per type")):
+            ttk.Radiobutton(scope, text=text, value=value,
+                            variable=self.group_scope_var,
+                            style="Card.TRadiobutton").pack(anchor="w")
+        self.group_scope_var.trace_add("write", self._sync_group_ui)
+
         self.types_frame = tk.Frame(card, bg=PALETTE["card"])
-        self.types_frame.grid(row=6, column=0, columnspan=2, sticky="ew")
+        self.types_frame.grid(row=7, column=0, columnspan=2, sticky="ew")
 
         self.type_vars = {}
         self.weekday_vars = {}
         self.booking_for_vars = {}
         self.day_count_labels = {}
+        self.group_buttons = {}
+        self.group_panels = {}
         self.current_appointment_choices = []
 
-    def build_group_card(self, parent):
+    # ------------------------------------------------------------ group forms
+    def new_group_state(self):
         """
-        Everything a Group (Family/Traveler) booking needs: how many people,
-        how their slots relate, and one form per extra person.
+        The variables behind one group form: how many people, how their slots
+        relate, and four member records (members 2..5).
 
-        Hidden unless some appointment type is set to Group — a single-applicant
-        scan should not have to scroll past four empty member forms. The forms
-        themselves are built once here and only shown or hidden afterwards, so
-        dropping the member count and raising it again does not lose what was
-        typed into the tabs that disappeared.
+        Kept separate from the widgets because the widgets are rebuilt whenever
+        the appointment-type list changes and the per-type panels are built only
+        when first expanded — the data has to outlive both. The widget handles
+        below are refreshed by build_group_form on every build.
         """
-        body = make_card(parent, "Group booking")
-        self.group_card = body.master       # make_card returns the panel's body
-        body.columnconfigure(0, weight=1, uniform="f")
-        body.columnconfigure(1, weight=1, uniform="f")
-
-        self.group_count_var = tk.StringVar(value=GROUP_COUNT_DEFAULT)
-        self._combo(body, 0, 0, "People in group", self.group_count_var,
-                    GROUP_COUNT_CHOICES)
-        self.group_method_var = tk.StringVar(value=method_label(GROUP_METHOD_DEFAULT))
-        self._combo(body, 0, 1, "Allocation method", self.group_method_var,
-                    [m["label"] for m in APPOINTMENT_METHOD_CHOICES])
-
-        self.group_method_hint = tk.Label(
-            body, text="", bg=PALETTE["card"], fg=PALETTE["muted"],
-            font=FONT_SMALL, justify="left", wraplength=336)
-        self.group_method_hint.grid(row=2, column=0, columnspan=2, sticky="w",
-                                    pady=(0, 8))
-
-        tk.Label(body, text="Member 1 is the primary applicant from the card "
-                            "above. Fill in one tab per extra person — the "
-                            "portal checks every row before it will search.",
-                 bg=PALETTE["card"], fg=PALETTE["muted"], font=FONT_SMALL,
-                 justify="left", wraplength=336).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-        self.group_notebook = ttk.Notebook(body, style="Group.TNotebook")
-        self.group_notebook.grid(row=4, column=0, columnspan=2, sticky="ew")
-
-        self.group_member_vars = []
-        self.group_member_tabs = []
-        for _ in range(2, GROUP_MEMBER_MAX + 1):
-            tab = tk.Frame(self.group_notebook, bg=PALETTE["card"],
-                           padx=10, pady=10)
-            tab.columnconfigure(0, weight=1, uniform="g")
-            tab.columnconfigure(1, weight=1, uniform="g")
-
-            fields = {
+        state = {
+            "count":  tk.StringVar(value=GROUP_COUNT_DEFAULT),
+            "method": tk.StringVar(value=method_label(GROUP_METHOD_DEFAULT)),
+            "members": [{
                 "firstname":   tk.StringVar(),
                 "surname":     tk.StringVar(),
                 "dob":         tk.StringVar(),
@@ -806,7 +827,49 @@ class App(tk.Tk):
                 "expiry":      tk.StringVar(),
                 "gender":      tk.StringVar(value=gender_label("2")),
                 "nationality": tk.StringVar(value=bot.APPLICANT_NATIONALITY_TEXT),
-            }
+            } for _ in range(2, GROUP_MEMBER_MAX + 1)],
+            "notebook": None, "tabs": [], "hint": None,
+        }
+        state["count"].trace_add("write", lambda *a: self._sync_group_form(state))
+        state["method"].trace_add("write", lambda *a: self._sync_group_form(state))
+        return state
+
+    def group_state_for(self, type_value):
+        """This appointment type's own group form, created on first use and
+        then kept for the life of the window."""
+        state = self.type_group_states.get(type_value)
+        if state is None:
+            state = self.type_group_states[type_value] = self.new_group_state()
+        return state
+
+    def build_group_form(self, parent, state, intro, wraplength=336):
+        """Renders one group form into `parent`, bound to `state`."""
+        parent.columnconfigure(0, weight=1, uniform="f")
+        parent.columnconfigure(1, weight=1, uniform="f")
+
+        self._combo(parent, 0, 0, "People in group", state["count"],
+                    GROUP_COUNT_CHOICES)
+        self._combo(parent, 0, 1, "Allocation method", state["method"],
+                    [m["label"] for m in APPOINTMENT_METHOD_CHOICES])
+
+        state["hint"] = tk.Label(parent, text="", bg=PALETTE["card"],
+                                 fg=PALETTE["muted"], font=FONT_SMALL,
+                                 justify="left", wraplength=wraplength)
+        state["hint"].grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        tk.Label(parent, text=intro, bg=PALETTE["card"], fg=PALETTE["muted"],
+                 font=FONT_SMALL, justify="left", wraplength=wraplength).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        notebook = ttk.Notebook(parent, style="Group.TNotebook")
+        notebook.grid(row=4, column=0, columnspan=2, sticky="ew")
+        state["notebook"] = notebook
+        state["tabs"] = []
+
+        for fields in state["members"]:
+            tab = tk.Frame(notebook, bg=PALETTE["card"], padx=10, pady=10)
+            tab.columnconfigure(0, weight=1, uniform="g")
+            tab.columnconfigure(1, weight=1, uniform="g")
             self._entry(tab, 0, 0, "First name", fields["firstname"])
             self._entry(tab, 0, 1, "Surname", fields["surname"])
             self._entry(tab, 2, 0, "Date of birth", fields["dob"])
@@ -815,14 +878,26 @@ class App(tk.Tk):
             self._combo(tab, 4, 1, "Gender", fields["gender"],
                         [g["label"] for g in GENDER_CHOICES])
             self._entry(tab, 6, 0, "Nationality", fields["nationality"])
+            state["tabs"].append(tab)
 
-            self.group_member_vars.append(fields)
-            self.group_member_tabs.append(tab)
+        self._sync_group_form(state)
+        return notebook
 
-        self.group_count_var.trace_add("write", self._sync_group_members)
-        self.group_method_var.trace_add("write", self._sync_group_members)
-        self._sync_group_members()
+    def build_group_card(self, parent):
+        """
+        The shared group form, used when every Group type books the same people.
 
+        Hidden unless some appointment type is set to Group and the master
+        switch is on shared mode — in per-type mode the forms live inline under
+        each type instead.
+        """
+        body = make_card(parent, "Group booking — shared by every Group type")
+        self.group_card = body.master       # make_card returns the panel's body
+        self.build_group_form(
+            body, self.group_state,
+            "Member 1 is the primary applicant from the card above. Fill in one "
+            "tab per extra person — the portal checks every row before it will "
+            "search.")
         # Built visible by make_card; the type list decides whether it stays.
         self.group_card.pack_forget()
 
@@ -834,32 +909,87 @@ class App(tk.Tk):
         "4": "A slot picked separately for each person.",
     }
 
-    def _sync_group_members(self, *args):
-        """Shows one tab per extra member and explains the chosen method."""
-        if not hasattr(self, "group_notebook"):
+    def _sync_group_form(self, state, *args):
+        """Shows one tab per extra member and explains the chosen method.
+
+        A no-op while this form has no widgets — the per-type panels are only
+        built when first expanded, but their variables are live from the start.
+        """
+        notebook = state.get("notebook")
+        if notebook is None or not notebook.winfo_exists():
             return
 
-        count = clamp_group_count(self.group_count_var.get())
-        for index, tab in enumerate(self.group_member_tabs, start=2):
+        count = clamp_group_count(state["count"].get())
+        for index, tab in enumerate(state["tabs"], start=2):
             if index <= count:
-                self.group_notebook.add(tab, text=f"Member {index}")
-            elif str(tab) in self.group_notebook.tabs():
-                self.group_notebook.hide(tab)
+                notebook.add(tab, text=f"Member {index}")
+            elif str(tab) in notebook.tabs():
+                notebook.hide(tab)
 
-        self.group_method_hint.config(
-            text=self.METHOD_HINTS.get(method_value(self.group_method_var.get()), ""))
+        hint = state.get("hint")
+        if hint is not None and hint.winfo_exists():
+            hint.config(text=self.METHOD_HINTS.get(
+                method_value(state["method"].get()), ""))
 
-    def _sync_group_card(self, *args):
-        """Reveals the Group card once any appointment type asks for it."""
+    def _toggle_group_panel(self, type_value):
+        self.group_panel_open[type_value] = not self.group_panel_open.get(type_value)
+        self._render_group_panel(type_value)
+
+    def _render_group_panel(self, type_value):
+        """Grids or un-grids one type's inline group form, building its widgets
+        the first time it is opened."""
+        holder = self.group_panels.get(type_value)
+        if holder is None or not holder.winfo_exists():
+            return
+
+        if self.group_panel_open.get(type_value):
+            if not holder.winfo_children():
+                self.build_group_form(
+                    holder, self.group_state_for(type_value),
+                    "Member 1 is the primary applicant. These details apply to "
+                    "this appointment type only.", wraplength=300)
+            if not holder.grid_info():
+                holder.grid(row=3, column=0, sticky="ew", padx=(20, 0),
+                            pady=(6, 2))
+        elif holder.grid_info():
+            holder.grid_remove()
+
+    def _sync_group_ui(self, *args):
+        """
+        Keeps the whole group UI in step with the two things that drive it: the
+        per-type "Booking as" dropdowns and the shared/per-type master switch.
+        """
         if not hasattr(self, "group_card") or not hasattr(self, "action_bar"):
             return
 
-        wanted = any(booking_for_value(var.get()) == "1"
-                     for var in self.booking_for_vars.values())
+        per_type = self.group_scope_var.get() == GROUP_SCOPE_PER_TYPE
+        any_group = False
+
+        for value, var in self.booking_for_vars.items():
+            is_group = booking_for_value(var.get()) == "1"
+            any_group = any_group or is_group
+
+            button = self.group_buttons.get(value)
+            if button is not None and button.winfo_exists():
+                if not is_group:
+                    button.config(state="disabled", text="⚙  Group Info")
+                elif per_type:
+                    button.config(state="normal", text="⚙  Edit Group Info")
+                else:
+                    # Shared mode: there is one form for every type, and it is
+                    # the card below — an inline copy here would be a second
+                    # place to edit the same data.
+                    button.config(state="disabled", text="⚙  Shared below")
+
+            if not (is_group and per_type):
+                self.group_panel_open[value] = False
+            self._render_group_panel(value)
+
         shown = bool(self.group_card.winfo_manager())
-        if wanted and not shown:
+        want_card = any_group and not per_type
+        if want_card and not shown:
             self.group_card.pack(fill=tk.X, pady=(0, 10), before=self.action_bar)
-        elif not wanted and shown:
+        elif not want_card and shown:
             self.group_card.pack_forget()
 
     def build_action_bar(self, parent):
@@ -880,6 +1010,13 @@ class App(tk.Tk):
                                         command=self.confirm_gate, kind="gold",
                                         state="disabled")
         self.confirm_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        # Live at all times: setting the preference before Chrome exists is how
+        # a restart knows what to do with the window it has not opened yet.
+        self.chrome_btn = ActionButton(bar, "", command=self.toggle_chrome_window,
+                                       kind="ghost")
+        self.chrome_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._sync_chrome_button()
 
     # ------------------------------------------------------------ field parts
     def _entry(self, parent, row, column, label, var, **kw):
@@ -951,6 +1088,12 @@ class App(tk.Tk):
         self.weekday_vars = {}
         self.booking_for_vars = {}
         self.day_count_labels = {}
+        # Widget handles only — the panels' contents are rebuilt on demand and
+        # their data lives in self.type_group_states, which is never cleared.
+        self.group_buttons = {}
+        self.group_panels = {}
+        for state in self.type_group_states.values():
+            state["notebook"], state["tabs"], state["hint"] = None, [], None
         for r, t in enumerate(self.current_appointment_choices):
             value = t["value"]
             block = tk.Frame(self.types_frame, bg=PALETTE["card"])
@@ -1005,14 +1148,27 @@ class App(tk.Tk):
             booking = tk.StringVar(
                 value=previous_booking.get(value, BOOKING_FOR_CHOICES[0]["label"]))
             self.booking_for_vars[value] = booking
-            booking.trace_add("write", self._sync_group_card)
+            booking.trace_add("write", self._sync_group_ui)
             ttk.Combobox(booking_row, textvariable=booking,
                          values=[c["label"] for c in BOOKING_FOR_CHOICES],
                          state="readonly", style="Field.TCombobox",
                          font=FONT_SMALL, width=11).pack(side=tk.LEFT)
 
+            # Opens this type's own group form inline, right below its row.
+            # _sync_group_ui owns its label and its enabled state.
+            self.group_buttons[value] = ActionButton(
+                booking_row, "⚙  Group Info", kind="ghost", padx=8, pady=3,
+                state="disabled",
+                command=lambda v=value: self._toggle_group_panel(v))
+            self.group_buttons[value].pack(side=tk.LEFT, padx=(6, 0))
+
+            self.group_panels[value] = tk.Frame(block, bg=PALETTE["card"],
+                                                highlightthickness=1,
+                                                highlightbackground=PALETTE["border"],
+                                                padx=10, pady=10)
+
         self.update_type_day_counts()
-        self._sync_group_card()
+        self._sync_group_ui()
 
     def _paint_day_toggle(self, bit, widget):
         """Selected weekdays are filled navy; skipped ones sit back in grey."""
@@ -1115,21 +1271,49 @@ class App(tk.Tk):
                         saved.get("booking_for", BOOKING_FOR_DEFAULT)))
 
             self.load_group_settings(data)
+            self.load_per_type_group_settings(data, saved_types)
+            self.group_scope_var.set(
+                data.get("group_scope", GROUP_SCOPE_DEFAULT)
+                if data.get("group_scope") in (GROUP_SCOPE_GLOBAL, GROUP_SCOPE_PER_TYPE)
+                else GROUP_SCOPE_DEFAULT)
+            visibility = data.get("chrome_visibility") or {}
+            self.hide_chrome_var.set(bool(visibility.get("hide_window",
+                                                         HIDE_CHROME_DEFAULT)))
+            self._sync_chrome_button()
             self.update_type_day_counts()
+            self._sync_group_ui()
         except Exception as e:
             print("Failed to load config:", e)
             self.update_appointment_types_ui()
 
-    def load_group_settings(self, data):
-        """Restores the group card. Absent from a config written before group
-        support, which is a two-person default and four empty forms."""
-        self.group_count_var.set(str(clamp_group_count(
-            data.get("group_member_count", GROUP_COUNT_DEFAULT))))
-        self.group_method_var.set(method_label(
-            data.get("group_method", GROUP_METHOD_DEFAULT)))
+    def load_per_type_group_settings(self, data, saved_types):
+        """
+        Restores each type's own group form.
 
-        saved_members = data.get("group_members") or []
-        for fields, saved in zip(self.group_member_vars, saved_members):
+        group_config_by_type is the complete picture; the group_config nested in
+        each appointment_types entry only covers the types the last scan ran, so
+        it is a fallback for a config written by something that only wrote that.
+        """
+        by_type = dict(data.get("group_config_by_type") or {})
+        for saved in saved_types:
+            if not isinstance(saved, dict):
+                continue
+            config = saved.get("group_config")
+            if config and saved.get("value") not in by_type:
+                by_type[saved["value"]] = config
+
+        for value, config in by_type.items():
+            if isinstance(config, dict):
+                self.load_group_state(self.group_state_for(value), config)
+
+    def load_group_state(self, state, config):
+        """Fills one group form from a saved {members, method, applicants}."""
+        state["count"].set(str(clamp_group_count(
+            config.get("members", GROUP_COUNT_DEFAULT))))
+        state["method"].set(method_label(
+            config.get("method", GROUP_METHOD_DEFAULT)))
+
+        for fields, saved in zip(state["members"], config.get("applicants") or []):
             if not isinstance(saved, dict):
                 continue
             for key in ("firstname", "surname", "dob", "passport",
@@ -1139,9 +1323,20 @@ class App(tk.Tk):
             if saved.get("gender"):
                 fields["gender"].set(gender_label(saved["gender"]))
 
-    def raw_group_members(self):
+    def load_group_settings(self, data):
+        """Restores the shared group form from the flat top-level keys. Absent
+        from a config written before group support, which is a two-person
+        default and four empty forms."""
+        self.load_group_state(self.group_state, {
+            "members": data.get("group_member_count", GROUP_COUNT_DEFAULT),
+            "method": data.get("group_method", GROUP_METHOD_DEFAULT),
+            "applicants": data.get("group_members") or [],
+        })
+
+    def raw_group_members(self, state=None):
         """Every member tab exactly as typed, for persistence. No validation —
         a half-filled tab the user is coming back to is worth keeping."""
+        state = state or self.group_state
         return [{
             "firstname":   fields["firstname"].get().strip(),
             "surname":     fields["surname"].get().strip(),
@@ -1150,17 +1345,20 @@ class App(tk.Tk):
             "expiry":      fields["expiry"].get().strip(),
             "gender":      gender_value(fields["gender"].get()),
             "nationality": fields["nationality"].get().strip(),
-        } for fields in self.group_member_vars]
+        } for fields in state["members"]]
 
-    def collect_group_members(self, count: int):
+    def collect_group_members(self, state, count: int, where: str = ""):
         """
-        Reads members 2..count off the tabs, validating as it goes.
+        Reads members 2..count off one group form, validating as it goes.
 
         Every field is required: these rows arrive blank on the portal, and
         #btn-search refuses to send anything while one visible row has a gap.
+        `where` names the appointment type in the error, which is what tells
+        the operator which of several group forms is short.
         """
+        prefix = f"{where} — " if where else ""
         members = []
-        for index, fields in enumerate(self.group_member_vars[:count - 1], start=2):
+        for index, fields in enumerate(state["members"][:count - 1], start=2):
             member = {
                 "firstname":   fields["firstname"].get().strip(),
                 "surname":     fields["surname"].get().strip(),
@@ -1173,11 +1371,11 @@ class App(tk.Tk):
                               ("passport", "passport number"),
                               ("nationality", "nationality")):
                 if not member[key]:
-                    raise ValueError(f"Member {index}: {name} is required.")
+                    raise ValueError(f"{prefix}Member {index}: {name} is required.")
             member["dob"] = normalize_date(fields["dob"].get(),
-                                           f"Member {index} date of birth")
+                                           f"{prefix}Member {index} date of birth")
             member["expiry"] = normalize_date(fields["expiry"].get(),
-                                              f"Member {index} passport expiry")
+                                              f"{prefix}Member {index} passport expiry")
             members.append(member)
         return members
 
@@ -1196,11 +1394,22 @@ class App(tk.Tk):
                 "scan_start_date": cfg["scan_start_date"],
                 "scan_end_date": cfg["scan_end_date"],
                 "appointment_types": cfg["appointment_types"],
+                # The shared form. Every tab, not just the ones this scan uses —
+                # dropping the count to 2 should not erase members 4 and 5.
                 "group_member_count": cfg["group_member_count"],
                 "group_method": cfg["group_method"],
-                # Every tab, not just the ones this scan uses — dropping the
-                # count to 2 and saving should not erase members 4 and 5.
                 "group_members": self.raw_group_members(),
+                "group_scope": self.group_scope_var.get(),
+                # Per-type forms, including types this scan left unticked, for
+                # the same reason. cfg["appointment_types"] carries a
+                # group_config too, but only for the types that actually ran.
+                "group_config_by_type": {
+                    value: {
+                        "members": str(clamp_group_count(state["count"].get())),
+                        "method": method_value(state["method"].get()),
+                        "applicants": self.raw_group_members(state),
+                    } for value, state in self.type_group_states.items()},
+                "chrome_visibility": {"hide_window": bool(self.hide_chrome_var.get())},
             }
             CONFIG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
@@ -1292,26 +1501,71 @@ class App(tk.Tk):
             self._hwnd = hwnd
         if hwnd is None:
             self.after(0, self.log, "Could not locate the Chrome window handle - hide/show will be unavailable.")
+            return
+
+        # This runs for every browser the scan opens, including the one a 429
+        # cooldown or a crash-recovery restart brings up, so the preference
+        # survives a restart without anything else having to remember it.
+        # Skipped while a gate has the window up on purpose.
+        if not self._force_visible:
+            self.after(0, self._apply_chrome_visibility)
+
+    def _apply_chrome_visibility(self, announce=True):
+        """Puts the Chrome window into whatever state the operator asked for."""
+        self._force_visible = False
+        with self._lock:
+            hwnd = self._hwnd
+        if hwnd is None:
+            return
+        hide = bool(self.hide_chrome_var.get())
+        try:
+            if hide:
+                win_hide.hide_window(hwnd)
+            else:
+                win_hide.show_window(hwnd)
+        except Exception as exc:
+            self.log(f"Could not change the Chrome window: {exc}")
+            return
+        if announce:
+            self.log("Chrome window hidden - running in the background."
+                     if hide else "Chrome window shown.")
 
     def _hide_window(self):
-        with self._lock:
-            hwnd = self._hwnd
-        if hwnd is None: return
-        try:
-            win_hide.hide_window(hwnd)
-            self.after(0, self.log, "Chrome window hidden - running in background.")
-        except Exception as exc:
-            self.after(0, self.log, f"Could not hide Chrome window: {exc}")
+        """Back to the operator's preference now the automation is on its own.
+        Not necessarily hidden — the name is what the bot's callers expect."""
+        self.after(0, self._apply_chrome_visibility)
 
     def _show_window(self):
+        """Forces the window up regardless of the preference — used by the gates,
+        where the operator has to see Chrome to sign in or pick a slot."""
+        self._force_visible = True
         with self._lock:
             hwnd = self._hwnd
-        if hwnd is None: return
+        if hwnd is None:
+            return
         try:
             win_hide.show_window(hwnd)
             self.after(0, self.log, "Chrome window restored to the foreground.")
         except Exception as exc:
             self.after(0, self.log, f"Could not restore Chrome window: {exc}")
+
+    def toggle_chrome_window(self):
+        self.hide_chrome_var.set(not self.hide_chrome_var.get())
+        self._sync_chrome_button()
+        self._apply_chrome_visibility()
+        with self._lock:
+            hwnd = self._hwnd
+        if hwnd is None:
+            self.log("Chrome is not open yet — the next browser window will "
+                     f"start {'hidden' if self.hide_chrome_var.get() else 'visible'}.")
+
+    def _sync_chrome_button(self):
+        """The button offers the state you are not in."""
+        if not hasattr(self, "chrome_btn"):
+            return
+        self.chrome_btn.config(
+            text="👁  Show Chrome Window" if self.hide_chrome_var.get()
+            else "🙈  Hide Chrome Window")
 
     def start_scan(self):
         try:
@@ -1370,12 +1624,28 @@ class App(tk.Tk):
                 raise ValueError("Pick at least one appointment type.")
 
             # Group details are only demanded when something actually books as
-            # a group — an Individual-only scan never opens the card.
+            # a group — an Individual-only scan never opens a group form.
+            per_type = self.group_scope_var.get() == GROUP_SCOPE_PER_TYPE
             group_count = clamp_group_count(self.group_count_var.get())
             group_method = method_value(self.group_method_var.get())
             group_members = []
-            if any(t["booking_for"] == "1" for t in chosen_types):
-                group_members = self.collect_group_members(group_count)
+            for t in chosen_types:
+                if t["booking_for"] != "1":
+                    continue
+                state = self.group_state_for(t["value"]) if per_type else self.group_state
+                count = clamp_group_count(state["count"].get())
+                # Named so a validation error says which type is short, which
+                # matters as soon as two types carry different people.
+                where = t["label"] if per_type else ""
+                t["group_config"] = {
+                    "members": str(count),
+                    "method": method_value(state["method"].get()),
+                    "applicants": self.collect_group_members(state, count, where),
+                }
+                if not per_type:
+                    group_count = count
+                    group_method = t["group_config"]["method"]
+                    group_members = t["group_config"]["applicants"]
 
             # A type whose weekdays never occur in the range would search nothing
             # and look like a hang, so catch it here rather than mid-scan.
@@ -1412,6 +1682,8 @@ class App(tk.Tk):
                 "group_member_count": str(group_count),
                 "group_method": group_method,
                 "group_members": group_members,
+                "group_scope": self.group_scope_var.get(),
+                "hide_chrome": bool(self.hide_chrome_var.get()),
             }
         except Exception as exc:
             messagebox.showerror("Validation Error", str(exc))
@@ -1432,11 +1704,16 @@ class App(tk.Tk):
             bot.log_to_file(f"    · {t['label']} — booking as "
                             f"{booking_for_label(t.get('booking_for', BOOKING_FOR_DEFAULT))}, "
                             f"weekdays {t['weekdays']}")
-        if cfg["group_members"]:
-            bot.log_to_file(
-                f"    Group: {cfg['group_member_count']} people, "
-                f"{method_label(cfg['group_method'])} "
-                f"(#appointmentmethod={cfg['group_method']})")
+            group = t.get("group_config")
+            if group:
+                bot.log_to_file(
+                    f"        group: {group['members']} people, "
+                    f"{method_label(group['method'])} "
+                    f"(#appointmentmethod={group['method']})")
+        if any(t.get("group_config") for t in cfg["appointment_types"]):
+            bot.log_to_file(f"    Group info: {cfg['group_scope']}")
+        bot.log_to_file(f"    Chrome window: "
+                        f"{'hidden' if cfg['hide_chrome'] else 'visible'}")
         bot.log_to_file("=" * 60)
 
         self.start_btn.config(state="disabled")
@@ -1574,6 +1851,12 @@ class App(tk.Tk):
             # Members 2..N. Row 0 on the portal is the primary applicant and is
             # filled from the APPLICANT_* settings above, never from here.
             bot.GROUP_MEMBERS = list(cfg.get("group_members") or [])
+            # Every Group type gets an explicit entry — in shared mode they all
+            # get the same one, so the engine never has to know which mode the
+            # GUI was in.
+            bot.GROUP_CONFIG_BY_TYPE = {
+                t["value"]: t["group_config"] for t in cfg["appointment_types"]
+                if t.get("group_config")}
 
             bot.print = patched_print
             bot.input = patched_input

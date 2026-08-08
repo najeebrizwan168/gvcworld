@@ -6,7 +6,10 @@ import time
 import random
 import hashlib
 import threading
+import subprocess
 from pathlib import Path
+
+import win_hide
 from datetime import datetime, timedelta
 
 from selenium import webdriver
@@ -20,6 +23,7 @@ from selenium.common.exceptions import (
     WebDriverException,
     InvalidSessionIdException,
     NoSuchWindowException,
+    TimeoutException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -166,28 +170,68 @@ APPOINTMENT_METHOD_LABELS = {
 # {surname, firstname, dob, passport, expiry, gender, nationality}.
 GROUP_MEMBERS = []
 
+# Per-appointment-type override, keyed by type value:
+#     {"members": "3", "method": "1", "applicants": [ {...}, ... ]}
+# A type with no entry books under the three module-level settings above, which
+# is what a plain script run (and the GUI's shared-group mode) uses. Different
+# types can want genuinely different groups — a family applying for Schengen and
+# one person applying for a national visa — so this is keyed, not global.
+GROUP_CONFIG_BY_TYPE = {}
+
 # Cloning runs off #members' change handler, so the rows appear asynchronously.
 GROUP_ROW_RENDER_SECONDS = 10
 
 
-def group_member_count() -> int:
+def _clamp_member_count(raw) -> int:
     """Total people in the group, clamped to what #members actually offers."""
     try:
-        count = int(str(GROUP_MEMBER_COUNT))
+        return max(2, min(5, int(str(raw).strip())))
     except (TypeError, ValueError):
         return 2
-    return max(2, min(5, count))
 
 
-def group_appointment_method() -> str:
-    value = str(GROUP_APPOINTMENT_METHOD)
-    return value if value in APPOINTMENT_METHOD_LABELS else "1"
+def group_config_for_type(type_value=None) -> dict:
+    """
+    The group settings this appointment type books under.
+
+    Falls back to the module-level defaults when the type has no entry of its
+    own, so a bare script run and the GUI's "same group for every type" mode
+    both work without populating GROUP_CONFIG_BY_TYPE at all.
+    """
+    entry = GROUP_CONFIG_BY_TYPE.get(type_value)
+    if not entry:
+        entry = {"members": GROUP_MEMBER_COUNT,
+                 "method": GROUP_APPOINTMENT_METHOD,
+                 "applicants": GROUP_MEMBERS}
+    method = str(entry.get("method", GROUP_APPOINTMENT_METHOD))
+    return {
+        "members": _clamp_member_count(entry.get("members")),
+        "method": method if method in APPOINTMENT_METHOD_LABELS else "1",
+        "applicants": list(entry.get("applicants") or []),
+    }
+
+
+def group_member_count(type_value=None) -> int:
+    return group_config_for_type(type_value)["members"]
+
+
+def group_appointment_method(type_value=None) -> str:
+    return group_config_for_type(type_value)["method"]
+
+
+def group_members_for(type_value=None) -> list:
+    return group_config_for_type(type_value)["applicants"]
+
+
+def group_types() -> list:
+    """Every configured appointment type that will be searched as a group."""
+    return [(value, label) for value, label in APPOINTMENT_TYPES
+            if booking_for_for_type(value) == BOOKING_FOR_GROUP]
 
 
 def group_is_configured() -> bool:
     """True when at least one appointment type will be searched as a group."""
-    return any(booking_for_for_type(value) == BOOKING_FOR_GROUP
-               for value, _ in APPOINTMENT_TYPES)
+    return bool(group_types())
 
 
 SCAN_START_DATE_STR = ""  # format: dd/mm/yyyy
@@ -296,6 +340,12 @@ SCAN_STATE_FILE = PERSIST_DIR / "gvc_scan_state.json"
 LOG_DIR = PERSIST_DIR / "logs"
 LOG_RETENTION = 20          # session files kept; older ones are pruned on start
 
+# ChromeDriver's own verbose log. "Examine ChromeDriver verbose log to determine
+# the cause" is useless advice unless the log is actually being written, so it
+# always is. One file, overwritten per launch — it is only ever read to explain
+# the launch that just failed.
+CHROMEDRIVER_LOG = LOG_DIR / "chromedriver.log"
+
 # Cookie names that indicate a live portal session. Substring match, lowercased
 # — the portal is ASP.NET today but the check shouldn't be brittle about it.
 SESSION_COOKIE_HINTS = ("session", "sessid", "asp.net", "auth", "token",
@@ -305,6 +355,21 @@ SESSION_COOKIE_HINTS = ("session", "sessid", "asp.net", "auth", "token",
 # before starting it again. Too short and Chrome refuses with "user data
 # directory is already in use".
 DRIVER_CLEANUP_SECONDS = 12
+
+# How long to wait for browser processes we own to actually exit before giving
+# up on them. quit() is asynchronous and a crashed renderer can outlive it.
+DRIVER_KILL_TIMEOUT = 15.0
+
+# How long to let a quit() browser exit by itself before terminating it. Chrome
+# writes its cookie jar on shutdown; killing it mid-flush costs the session.
+DRIVER_GRACE_SECONDS = 5.0
+
+# Auto-recovery: how long to wait before reopening the browser, doubling each
+# consecutive failure, and how many failures in a row before stopping. The old
+# loop waited a flat 10s forever — 38 identical retries across the logs.
+RECOVERY_BACKOFF_SECONDS = 10
+RECOVERY_BACKOFF_MAX = 300
+RECOVERY_MAX_ATTEMPTS = 6
 
 # Ceiling on the wait for a human to finish signing in. Polled, so a fast login
 # costs nothing — this only bounds how long an abandoned run waits.
@@ -714,32 +779,95 @@ def inject_session_cookies(driver, cookies) -> int:
     return added
 
 
-def is_logged_in(driver) -> bool:
-    """
-    True when the browser is holding a usable portal session.
+LOGGED_IN = "LOGGED_IN"
+LOGGED_OUT = "LOGGED_OUT"
+RENDER_TIMEOUT = "RENDER_TIMEOUT"
 
-    Deliberately assertion-based rather than time-based: the login page's own
-    fields disappearing plus either an app-only element or a session cookie is
-    what actually distinguishes "signed in" from "still on the form".
+# How long to let the page render before giving up on deciding what it is.
+SESSION_STATE_TIMEOUT = 30
+
+
+def describe_session_cookie(driver) -> str:
+    """
+    Names the session cookie and reports its expiry, without ever printing its
+    value — it is a bearer token for the account.
+
+    "Saved N cookie(s)" was not diagnostic: the count drifted 8 → 6 → 11 across
+    the failing run and there was no way to tell which one had gone.
     """
     try:
-        state = driver.execute_script("""
-            return {
-                login: !!(document.querySelector('#username')
-                          && document.querySelector('#password')),
-                app:   !!(document.querySelector('#appointment')
-                          || document.querySelector('a[href*="/appointments"]')
-                          || document.querySelector('a[href*="logout"]')
-                          || document.querySelector('a[href*="/user/"]'))
-            };
-        """)
+        cookies = portal_session_cookies(driver)
     except WebDriverException as err:
         _reraise_if_dead(err)
-        return False
+        return "(unreadable)"
+    if not cookies:
+        return "none"
 
-    if not state or state.get("login"):
-        return False
-    return bool(state.get("app")) or bool(portal_session_cookies(driver))
+    parts = []
+    for cookie in cookies:
+        expiry = cookie.get("expiry")
+        if expiry:
+            try:
+                when = datetime.fromtimestamp(expiry).isoformat(timespec="minutes")
+            except (OSError, OverflowError, ValueError):
+                when = str(expiry)
+        else:
+            when = "session"
+        parts.append(f"{cookie.get('name')}(expires {when})")
+    return ", ".join(parts)
+
+
+def session_state(driver, timeout=SESSION_STATE_TIMEOUT) -> str:
+    """
+    Resolves what the browser is actually looking at: LOGGED_IN, LOGGED_OUT or
+    RENDER_TIMEOUT.
+
+    Three states, not two. The old check was a *negative* one — "the login form
+    is absent, and there is either an app element or a session cookie" — and on
+    this site that is unsound twice over. The page is client-rendered and
+    reaches readyState 'complete' with an empty body, so on a blank page the
+    login form is absent too; and a cookie sitting in the jar says nothing about
+    whether the server still honours it. Between them, a blank page holding a
+    dead cookie was reported as a live session, which is exactly what happened
+    at 17:39:13 and 17:40:10.
+
+    So: only #manage-account proves a session (it exists only when
+    authenticated), only the login form proves the absence of one, and anything
+    else means the page has not finished rendering — keep waiting.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            state = driver.execute_script("""
+                return {
+                    app:   !!document.querySelector('#manage-account'),
+                    login: !!(document.querySelector('#username')
+                              || document.querySelector('#password')),
+                    title: document.title || ''
+                };
+            """)
+        except WebDriverException as err:
+            _reraise_if_dead(err)
+            state = None
+
+        if state:
+            if state.get("app"):
+                return LOGGED_IN
+            # Early exit: the answer is knowable in about two seconds here, and
+            # waiting the full timeout for a marker that will never appear was
+            # most of the recovery loop's runtime.
+            if state.get("login"):
+                return LOGGED_OUT
+
+        if time.monotonic() >= deadline:
+            return RENDER_TIMEOUT
+        time.sleep(0.5)
+
+
+def is_logged_in(driver, timeout=SESSION_STATE_TIMEOUT) -> bool:
+    """True only on positive proof of a session. Kept as a boolean for the
+    callers that only need to know whether to proceed."""
+    return session_state(driver, timeout) == LOGGED_IN
 
 
 def wait_for_login(driver, timeout=LOGIN_DETECT_TIMEOUT_SECONDS) -> bool:
@@ -789,9 +917,16 @@ def restore_session(driver) -> bool:
     driver.get(TARGET_URL)
     install_network_probe(driver)
 
-    if is_logged_in(driver):
+    state = session_state(driver)
+    debug(f"Session check: {state}. Portal session cookie: "
+          f"{describe_session_cookie(driver)}")
+    if state == LOGGED_IN:
         debug("✓ The saved Chrome profile is still signed in — skipping the login gate.")
         return True
+    if state == RENDER_TIMEOUT:
+        debug("⚠ The portal never rendered within "
+              f"{SESSION_STATE_TIMEOUT}s — treating the profile session as "
+              "unusable rather than guessing.")
 
     cookies = load_session_cookies()
     if not cookies:
@@ -803,12 +938,24 @@ def restore_session(driver) -> bool:
     driver.get(TARGET_URL)
     install_network_probe(driver)
 
-    if is_logged_in(driver):
+    # Verified, not assumed. The old code logged "✓ Saved cookies restored the
+    # session" off the same broken check, so a dead cookie set was announced as
+    # a recovery and then written back over the good one.
+    injected_state = session_state(driver)
+    debug(f"Post-injection check: {injected_state}. Portal session cookie: "
+          f"{describe_session_cookie(driver)}")
+    if injected_state == LOGGED_IN:
         debug("✓ Saved cookies restored the session — skipping the login gate.")
         return True
 
+    if injected_state == LOGGED_OUT:
+        debug("The saved cookies are stale — discarding them so the next launch "
+              "does not replay a dead session.")
+        clear_session_cookies()
+    else:
+        debug("⚠ The portal never rendered after injecting the cookies — keeping "
+              "them, since nothing here proves they are dead.")
     debug("The saved session has expired — a manual login is needed.")
-    clear_session_cookies()
     return False
 
 
@@ -833,9 +980,11 @@ def scan_signature() -> str:
         # a checkpoint taken under one must not resume under the other.
         "|".join(f"{v}={booking_for_for_type(v)}" for v, _ in APPOINTMENT_TYPES),
         # Likewise a group of three and a group of four are different searches,
-        # and so are two allocation methods over the same three people.
-        (f"{group_member_count()}/{group_appointment_method()}"
-         if group_is_configured() else "-"),
+        # and so are two allocation methods over the same three people — and
+        # each Group type carries its own, so each one is fingerprinted.
+        "|".join(f"{value}={c['members']}/{c['method']}/{len(c['applicants'])}"
+                 for value, c in ((v, group_config_for_type(v))
+                                  for v, _ in group_types())) or "-",
     ]
     return hashlib.sha1("~".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -1667,7 +1816,7 @@ def select_booking_for(driver, type_value: str):
                 f"Could not set Booking as to {label}: #bookingfor reads {applied!r}")
 
     if wanted == BOOKING_FOR_GROUP:
-        _prepare_group_booking(driver)
+        _prepare_group_booking(driver, type_value)
     return wanted
 
 
@@ -1680,8 +1829,43 @@ GROUP_ROW_COUNT_JS = """
         function (tr) { return !tr.classList.contains('hidden'); }).length;
 """
 
+# Resolves one field inside one row.
+#
+# The name is still the primary key — the clone rows share the template's ids,
+# so an id lookup would land in the hidden #secondTr. But the *primary* row does
+# not carry the same name attributes as the clones: the live page reported
+# `nationality[id] (no field)` on row 0 every cycle, while the clones matched
+# fine. So: exact name, then a looser name match, then this row's own gp_/ex_
+# id as a last resort. Every step stays scoped to the row it was handed.
+GROUP_ROW_FIELD_JS = r"""
+function rowField(row, name) {
+    var el = row.querySelector('[name="applicants[][' + name + ']"]');
+    if (el) { return el; }
 
-def _prepare_group_booking(driver):
+    // Some rows spell the name differently (e.g. without the applicants[][]
+    // wrapper). Match on the trailing field name instead.
+    var bare = name.replace(/\[id\]$/, '');
+    var candidates = row.querySelectorAll('input[name], select[name]');
+    for (var i = 0; i < candidates.length; i++) {
+        var n = candidates[i].getAttribute('name') || '';
+        if (n === name || n.indexOf(name) !== -1) { return candidates[i]; }
+        if (n === bare || n.indexOf('[' + bare + ']') !== -1) { return candidates[i]; }
+    }
+
+    // Last resort: this row's own id, which is unique on the primary row and
+    // merely duplicated (never wrong) on the clones, because we scoped first.
+    var suffix = '_' + bare;
+    var byId = row.querySelectorAll('input[id], select[id]');
+    for (var j = 0; j < byId.length; j++) {
+        var id = byId[j].id || '';
+        if (id.indexOf(suffix) !== -1) { return byId[j]; }
+    }
+    return null;
+}
+"""
+
+
+def _prepare_group_booking(driver, type_value=None):
     """
     Brings the form into group mode and fills every extra applicant row.
 
@@ -1689,9 +1873,13 @@ def _prepare_group_booking(driver):
     interchangeable: #members has to go first because setting it is what clones
     the rows, the clones render asynchronously so they have to be waited for,
     and only then can the rows be written to.
+
+    Everything comes from this appointment type's own group config, so two
+    Group types in one scan can carry different people and different sizes.
     """
-    count = group_member_count()
-    method = group_appointment_method()
+    config = group_config_for_type(type_value)
+    count = config["members"]
+    method = config["method"]
     debug(f"Group booking: {count} people, allocation method {method} "
           f"({APPOINTMENT_METHOD_LABELS[method]}).")
 
@@ -1710,7 +1898,7 @@ def _prepare_group_booking(driver):
         debug("⚠ #appointmentmethod is missing — leaving the allocation method "
               "as the portal set it.")
 
-    fill_group_member_rows(driver, count)
+    fill_group_member_rows(driver, count, config["applicants"])
     report_group_row_gaps(driver)
 
 
@@ -1771,7 +1959,7 @@ def _wait_for_group_rows(driver, expected: int, timeout=None) -> int:
 # [name="applicants[][…]"] scoped to a row: the clones reuse the template's ids
 # (#ex_surname and friends), so an id lookup lands in the hidden #secondTr and
 # the data goes nowhere the portal will submit.
-FILL_GROUP_ROWS_JS = r"""
+FILL_GROUP_ROWS_JS = GROUP_ROW_FIELD_JS + r"""
 var people = arguments[0];
 var report = [];
 
@@ -1780,7 +1968,7 @@ var rows = Array.prototype.filter.call(
     function (tr) { return !tr.classList.contains('hidden'); });
 
 function field(row, name) {
-    return row.querySelector('[name="applicants[][' + name + ']"]');
+    return rowField(row, name);
 }
 
 function setText(el, value) {
@@ -1861,7 +2049,7 @@ def _group_member_payload(member: dict) -> dict:
     }
 
 
-def fill_group_member_rows(driver, count: int):
+def fill_group_member_rows(driver, count: int, applicants=None):
     """
     Writes members 2..count into the cloned rows.
 
@@ -1870,8 +2058,10 @@ def fill_group_member_rows(driver, count: int):
     per-field outcome — passport numbers and dates of birth do not belong in a
     transcript that gets shared when something goes wrong.
     """
+    if applicants is None:
+        applicants = GROUP_MEMBERS
     wanted = max(0, count - 1)
-    people = [_group_member_payload(m) for m in GROUP_MEMBERS[:wanted]]
+    people = [_group_member_payload(m) for m in applicants[:wanted]]
 
     if len(people) < wanted:
         debug(f"⚠ Group is set to {count} people but only {len(people) + 1} have "
@@ -1896,7 +2086,7 @@ def fill_group_member_rows(driver, count: int):
 
 # Reports which visible row still has an empty required cell. Named fields only,
 # and it returns the field names rather than their contents.
-GROUP_ROW_GAPS_JS = r"""
+GROUP_ROW_GAPS_JS = GROUP_ROW_FIELD_JS + r"""
 var rows = Array.prototype.filter.call(
     document.querySelectorAll('#groupBody tr'),
     function (tr) { return !tr.classList.contains('hidden'); });
@@ -1908,7 +2098,7 @@ var gaps = [];
 for (var i = 0; i < rows.length; i++) {
     var blank = [];
     for (var n = 0; n < names.length; n++) {
-        var el = rows[i].querySelector('[name="applicants[][' + names[n] + ']"]');
+        var el = rowField(rows[i], names[n]);
         if (!el) { blank.push(names[n] + ' (no field)'); continue; }
         if (!String(el.value || '').trim()) { blank.push(names[n]); }
     }
@@ -1917,6 +2107,26 @@ for (var i = 0; i < rows.length; i++) {
     }
 }
 return { rows: rows.length, gaps: gaps };
+"""
+
+# Dumps what each visible row actually offers. Names and ids only — never
+# values, which are the applicant's passport and date of birth. Logged once per
+# group setup so a mismatch like the primary row's nationality is diagnosable
+# from the transcript instead of needing a live debugging session.
+GROUP_ROW_SHAPE_JS = r"""
+return Array.prototype.map.call(
+    Array.prototype.filter.call(
+        document.querySelectorAll('#groupBody tr'),
+        function (tr) { return !tr.classList.contains('hidden'); }),
+    function (row) {
+        return {
+            row: row.id || '(primary)',
+            fields: Array.prototype.map.call(
+                row.querySelectorAll('input[name], select[name]'),
+                function (el) { return (el.getAttribute('name') || '') +
+                                       (el.id ? '#' + el.id : ''); })
+        };
+    });
 """
 
 
@@ -1943,6 +2153,17 @@ def report_group_row_gaps(driver) -> bool:
     for gap in gaps:
         debug(f"⚠ Member {gap.get('member')} (row {gap.get('row')}) is missing: "
               f"{', '.join(gap.get('blank', []))}")
+
+    # A "(no field)" means the row does not expose that name at all, which is a
+    # shape problem rather than an empty box. Print the row's real field names
+    # so the next run explains itself instead of repeating the same warning.
+    if any("(no field)" in entry for gap in gaps for entry in gap.get("blank", [])):
+        try:
+            for row in driver.execute_script(GROUP_ROW_SHAPE_JS) or []:
+                debug(f"   row {row.get('row')} offers: "
+                      f"{', '.join(row.get('fields', [])) or '(nothing)'}")
+        except WebDriverException as err:
+            _reraise_if_dead(err)
     debug("Search validates every visible row before it sends anything, so it "
           "will refuse until those are filled in.")
     return False
@@ -2255,11 +2476,34 @@ def ensure_vac(driver):
 
     debug(f"Checking VAC from profile page to ensure it's {target_label}...")
     
-    # 2. Get Profile URL
+    # 2. Get Profile URL.
+    # Waited for, not read straight off: this site is client-rendered and
+    # reaches readyState 'complete' with an empty body, so a bare find_element
+    # here loses a race it cannot see. The logs show it failing in the same
+    # second the login check passed — the element simply had not rendered yet.
+    # Resolve the session first. #manage-account is the logged-in marker, so
+    # waiting 30s for it on a page that is already showing the login form is
+    # 30s spent proving something the first poll knew. It also turns "session
+    # expired" into its own outcome instead of a generic crash.
+    state = session_state(driver)
+    if state == LOGGED_OUT:
+        raise SessionLostError(
+            "The portal is showing the login page — the saved session is no "
+            "longer valid.")
+    if state == RENDER_TIMEOUT:
+        raise Exception(
+            f"The portal never rendered within {SESSION_STATE_TIMEOUT}s — no "
+            f"login form and no signed-in marker. Page state: {describe_page(driver)}")
+
     try:
-        profile_url = driver.find_element(By.CSS_SELECTOR, "#manage-account").get_attribute("href")
-    except Exception:
-        raise Exception("Could not locate #manage-account to find profile URL.")
+        profile_url = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "#manage-account"))
+        ).get_attribute("href")
+    except TimeoutException:
+        raise Exception(
+            "Could not locate #manage-account after 30s — the page never "
+            f"finished rendering, or the session is no longer signed in. "
+            f"Page state: {describe_page(driver)}")
         
     driver.get(profile_url)
     
@@ -2419,10 +2663,16 @@ def describe_page(driver) -> str:
                 text:  body.replace(/\\s+/g, ' ').slice(0, 220)
             };
         """)
-        return (f"url={info['url']} | title={info['title']!r} | "
-                f"present={info['has']} | body={info['text']!r}")
+        if not info:
+            return "(page returned nothing to inspect)"
+        return (f"url={info.get('url')} | title={info.get('title')!r} | "
+                f"present={info.get('has')} | body={info.get('text')!r}")
     except WebDriverException as err:
         return f"(could not inspect page: {type(err).__name__})"
+    except Exception as err:
+        # This runs on the failure path. It must never be the thing that
+        # raises, or it hides the error it was called to explain.
+        return f"(could not describe page: {type(err).__name__})"
 
 
 def open_appointment_page(driver, attempts=3):
@@ -2501,6 +2751,188 @@ def reopen_appointment_form(driver, reason: str):
 # ============================================================================
 # BROWSER LAUNCH + LOGIN (reusable for auto-recovery)
 # ============================================================================
+# chromedriver PIDs this process has started. Everything teardown touches is
+# derived from these, so it can only ever reach browsers we own.
+_owned_driver_pids = set()
+
+# ChromeDriver's answer when the profile directory is still held by a browser
+# that has not finished exiting. "Chrome instance exited" is the one that
+# actually shows up in the logs; the retry used to test only for the second
+# string, so it never fired on the failure that was really happening.
+PROFILE_BUSY_MARKERS = (
+    "chrome instance exited",
+    "user data directory is already in use",
+    "cannot create default profile directory",
+    "probably user data directory is already in use",
+)
+
+
+def _chrome_service():
+    """
+    Builds the ChromeDriver service, with its verbose log pointed at a file.
+
+    Without this, "session not created: Chrome instance exited. Examine
+    ChromeDriver verbose log to determine the cause." is a dead end — the log it
+    names was never being written, so the cause was never recoverable after the
+    fact. One file, overwritten per launch, next to the session transcripts.
+    """
+    driver_path = ChromeDriverManager().install()
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return Service(driver_path, log_output=str(CHROMEDRIVER_LOG),
+                       service_args=["--verbose"])
+    except (OSError, TypeError):
+        # Older Selenium without log_output, or an unwritable directory: a
+        # driver with no diagnostics still beats no driver at all.
+        return Service(driver_path)
+
+
+def _driver_version(path) -> str:
+    """chromedriver.exe --version is a console app: it prints and exits. Still
+    bounded, and it never gets a window."""
+    try:
+        result = subprocess.run([str(path), "--version"], capture_output=True,
+                                text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return (result.stdout or result.stderr or "").strip()
+    except Exception as err:
+        return f"(could not read: {type(err).__name__})"
+
+
+def _chrome_version() -> str:
+    """
+    Chrome's version, without launching Chrome.
+
+    `chrome.exe --version` is NOT used: on this machine it does not print and
+    exit — it blocks indefinitely, which would hang the scanner at startup. The
+    version resource and the versioned install directory both give the same
+    answer for free.
+    """
+    for candidate in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                      r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"):
+        exe = Path(candidate)
+        if not exe.exists():
+            continue
+        try:
+            version = win_hide.file_version(exe)
+        except Exception:
+            version = ""
+        if version:
+            return version
+        # Chrome installs each build into a directory named for its version.
+        versions = sorted((d.name for d in exe.parent.iterdir()
+                           if d.is_dir() and re.fullmatch(r"\d+(\.\d+)+", d.name)),
+                          key=lambda n: [int(p) for p in n.split(".")])
+        if versions:
+            return versions[-1]
+    return ""
+
+
+def _major(version_text: str) -> str:
+    match = re.search(r"(\d+)\.", version_text or "")
+    return match.group(1) if match else ""
+
+
+def report_browser_versions():
+    """
+    Prints Chrome's and ChromeDriver's versions, and warns on a major mismatch.
+
+    A major-version gap is the classic cause of "Chrome instance exited" on a
+    cold start — Chrome updates itself in the background and the cached driver
+    does not follow. Reported rather than fatal: the versions in this
+    installation match, so refusing to start on a mismatch would be guessing at
+    a failure mode we have not actually observed here.
+    """
+    try:
+        driver_path = ChromeDriverManager().install()
+    except Exception as err:
+        debug(f"⚠ Could not resolve a ChromeDriver ({type(err).__name__}: {err}).")
+        return None
+
+    driver_version = _driver_version(driver_path)
+    chrome_version = _chrome_version()
+
+    debug(f"Chrome:       {chrome_version or '(not found in the usual place)'}")
+    debug(f"ChromeDriver: {driver_version}")
+    debug(f"   driver binary: {driver_path}")
+
+    chrome_major, driver_major = _major(chrome_version), _major(driver_version)
+    if chrome_major and driver_major and chrome_major != driver_major:
+        debug(f"⚠ VERSION MISMATCH: Chrome is {chrome_major}.x but ChromeDriver is "
+              f"{driver_major}.x. Chrome will refuse to start under it. Delete "
+              f"{Path(driver_path).parent} to force a fresh download.")
+    return {"chrome": chrome_version, "driver": driver_version, "path": driver_path}
+
+
+def _register_driver(driver):
+    """Remembers the chromedriver PID behind this driver so teardown can find
+    the browser it spawned."""
+    try:
+        pid = driver.service.process.pid
+    except Exception:
+        return None
+    if pid:
+        _owned_driver_pids.add(pid)
+    return pid
+
+
+def force_close_browser(driver=None, reason="") -> dict:
+    """
+    Closes the browser and *verifies* the processes are gone.
+
+    driver.quit() is not reliable here. It is asynchronous, and when the
+    renderer has already crashed — which is exactly the situation auto-recovery
+    runs in — it can return while chrome.exe is still alive holding the profile
+    directory. The next launch then dies with "Chrome instance exited", and
+    because the old code swallowed quit()'s failure and never checked, the loop
+    retried straight back into the same wall.
+
+    So: ask politely, then confirm, then kill by owned PID. Never by image name
+    — `taskkill /im chrome.exe` would take the operator's own browser with it.
+    """
+    pids = set(_owned_driver_pids)
+    if driver is not None:
+        pid = _register_driver(driver)
+        if pid:
+            pids.add(pid)
+        try:
+            driver.quit()
+        except Exception as err:
+            debug(f"   quit() did not complete cleanly ({type(err).__name__}) — "
+                  f"falling back to closing the processes directly.")
+
+    if not pids:
+        return {"targets": 0, "killed": 0, "survivors": []}
+
+    # Give Chrome a moment to go on its own before terminating it. Chrome
+    # flushes its cookie database on shutdown, and killing it mid-flush loses
+    # the session cookies the next launch depends on — which is the likeliest
+    # reason the saved count drifted 8 → 6 across the failing run.
+    grace = time.monotonic() + DRIVER_GRACE_SECONDS
+    while time.monotonic() < grace:
+        if not any(win_hide.process_is_alive(pid) for pid in pids):
+            break
+        time.sleep(0.25)
+
+    total = {"targets": 0, "killed": 0, "survivors": []}
+    for pid in pids:
+        result = win_hide.kill_process_tree(pid, timeout=DRIVER_KILL_TIMEOUT)
+        total["targets"] += result["targets"]
+        total["killed"] += result["killed"]
+        total["survivors"].extend(result["survivors"])
+
+    _owned_driver_pids.difference_update(pids - set(total["survivors"]))
+
+    if total["targets"]:
+        where = f" ({reason})" if reason else ""
+        debug(f"   Browser teardown{where}: {total['killed']}/{total['targets']} "
+              f"process(es) closed.")
+    if total["survivors"]:
+        debug(f"⚠ {len(total['survivors'])} browser process(es) would not close: "
+              f"{total['survivors']}. The next launch may fail on the profile lock.")
+    return total
+
+
 def start_chrome():
     """
     Starts Chrome against the persistent profile directory.
@@ -2508,7 +2940,12 @@ def start_chrome():
     The persistent profile is what makes an automatic restart viable: cookies,
     local storage and the portal's own device trust all survive, so a rebuilt
     browser lands back on an authenticated session instead of a reCAPTCHA.
+
+    Anything we still own is torn down first, unconditionally: a browser left
+    behind by a crashed round holds this exact directory, and the whole point of
+    the persistent profile is that there is only one of it.
     """
+    force_close_browser(reason="before launch")
     debug("Launching Chrome Browser via Selenium...")
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -2546,17 +2983,19 @@ def start_chrome():
     last_error = None
     for attempt in (1, 2, 3):
         try:
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=options
-            )
+            driver = webdriver.Chrome(service=_chrome_service(), options=options)
+            _register_driver(driver)
             break
         except WebDriverException as err:
             last_error = err
-            if "user data directory is already in use" not in str(err).lower():
+            message = str(err).lower()
+            if not any(marker in message for marker in PROFILE_BUSY_MARKERS):
                 raise
             debug(f"The Chrome profile is still locked by the closing browser "
-                  f"(attempt {attempt}/3) — waiting for it to let go...")
+                  f"(attempt {attempt}/3) — closing whatever still holds it...")
+            # The lock is held by a process, not a file. Clearing it means
+            # closing that process; waiting alone is what used to fail.
+            force_close_browser(reason=f"profile still locked, attempt {attempt}")
             interruptible_sleep(DRIVER_CLEANUP_SECONDS, "Waiting for the Chrome profile")
     else:
         raise last_error
@@ -2688,14 +3127,15 @@ def launch_browser_and_login():
 
 def shutdown_browser(driver):
     """Closes Chrome. Used by the restart path, where the teardown has to happen
-    before the wait rather than after it."""
+    before the wait rather than after it.
+
+    Goes through force_close_browser so the rate-limit restart gets the same
+    verified teardown as auto-recovery — it is a restart against the same
+    single-instance profile either way."""
     if driver is None:
         return
-    try:
-        driver.quit()
-        debug("Chrome closed.")
-    except Exception:
-        pass
+    force_close_browser(driver, reason="rate-limit restart")
+    debug("Chrome closed.")
 
 
 def is_browser_alive(driver) -> bool:
@@ -2741,23 +3181,25 @@ def main():
     print("=" * 60)
     if _session_log_path is not None:
         print(f"  Session log: {_session_log_path}")
+    report_browser_versions()
     print(f"  VAC: {vac_label(TARGET_CITY)} ({vac_id_for(TARGET_CITY)})")
     for value, label in APPOINTMENT_TYPES:
         print(f"    · {label} — booking as "
               f"{BOOKING_FOR_LABELS[booking_for_for_type(value)]}")
-    if group_is_configured():
-        count = group_member_count()
-        method = group_appointment_method()
-        print(f"  Group: {count} people, {APPOINTMENT_METHOD_LABELS[method]} "
-              f"(#appointmentmethod={method})")
-        print(f"    · Member 1 — the primary applicant above")
-        for index, member in enumerate(GROUP_MEMBERS[:count - 1], start=2):
+    for value, label in group_types():
+        config = group_config_for_type(value)
+        count, method = config["members"], config["method"]
+        applicants = config["applicants"]
+        print(f"  Group for {label}: {count} people, "
+              f"{APPOINTMENT_METHOD_LABELS[method]} (#appointmentmethod={method})")
+        print("    · Member 1 — the primary applicant above")
+        for index, member in enumerate(applicants[:count - 1], start=2):
             name = " ".join(part for part in
                             (str(member.get("firstname") or "").strip(),
                              str(member.get("surname") or "").strip()) if part)
             print(f"    · Member {index} — {name or '(no name configured)'}")
-        if len(GROUP_MEMBERS) < count - 1:
-            print(f"    ⚠ {count - 1 - len(GROUP_MEMBERS)} member(s) have no "
+        if len(applicants) < count - 1:
+            print(f"    ⚠ {count - 1 - len(applicants)} member(s) have no "
                   f"details — Search will refuse until they are filled in.")
     print("=" * 60)
 
@@ -2778,11 +3220,17 @@ def main():
               f"{pending.get('last_date_searched')}")
         print(f"    Pacing restored to {_search_interval:.1f}s between searches.")
 
+    # Consecutive failed recoveries. Reset the moment a launch succeeds, so a
+    # scan that has been running for hours is not stopped by six failures
+    # accumulated over the whole night.
+    recovery_attempts = 0
+
     # ── Outer loop: auto-recovers if the browser dies ──
     while True:
         driver = None
         try:
             driver, wait = launch_browser_and_login()
+            recovery_attempts = 0
 
             rounds_since_refresh = 0
 
@@ -2912,6 +3360,29 @@ def main():
             interruptible_sleep(seconds, "Rate-limit recovery")
             debug("Relaunching from the saved profile and picking the scan back up...")
 
+        except SessionLostError as expired:
+            # Not a fault. The portal requires a human at a reCAPTCHA, so this
+            # is the scanner waiting on a person — it must not consume the
+            # auto-recovery budget and stop the app while nobody is watching.
+            pending = load_checkpoint()
+            clear_session_cookies()
+            force_close_browser(driver, reason="session expired")
+            driver = None
+
+            print("\n" + "🔑" * 30)
+            print("  SESSION EXPIRED — SIGN-IN REQUIRED")
+            print(f"  {expired}")
+            print("  The portal's login form carries a reCAPTCHA, so this cannot be")
+            print("  automated. Chrome will reopen on the login page: sign in there and")
+            print("  the scan resumes on its own from where it stopped.")
+            if pending:
+                print(f"  Progress kept: round {pending.get('round')}, "
+                      f"{pending.get('last_appointment_label')}, "
+                      f"{pending.get('last_date_searched')}.")
+            print("  This is not counted as a recovery failure.")
+            print("🔑" * 30 + "\n")
+            interruptible_sleep(5, "Reopening for sign-in")
+
         except Exception as e:
             print(f"\n[ERROR] {e}")
             import traceback
@@ -2919,28 +3390,45 @@ def main():
 
             # A crash mid-round is worth resuming from too — same checkpoint.
             pending = load_checkpoint()
-            if isinstance(e, SessionLostError):
-                # The saved cookies are what just failed; keep them and the next
-                # launch would silently retry a dead session.
-                clear_session_cookies()
-                print("  The portal session expired — you will be asked to sign in once more.")
             if pending:
                 print(f"  Progress kept: round {pending.get('round')}, "
                       f"{pending.get('last_appointment_label')}, "
                       f"{pending.get('last_date_searched')}.")
 
+            # Close the browser BEFORE the wait, not after it. The old order
+            # slept ten seconds with the crashed browser still holding the
+            # profile, quit it, then relaunched immediately — so the new Chrome
+            # raced the old one's shutdown and lost.
+            force_close_browser(driver, reason="auto-recovery")
+            driver = None
+
+            recovery_attempts += 1
+            if recovery_attempts >= RECOVERY_MAX_ATTEMPTS:
+                print("\n" + "=" * 60)
+                print(f"  ⛔ GIVING UP: {recovery_attempts} recovery attempts in a "
+                      f"row have all failed.")
+                print(f"  Last error: {type(e).__name__}: {e}")
+                print(f"  ChromeDriver's own log: {CHROMEDRIVER_LOG}")
+                print("  Nothing has been recorded as 'no availability'. Fix the "
+                      "cause and press Start again.")
+                print("=" * 60)
+                raise
+
+            wait_seconds = min(RECOVERY_BACKOFF_SECONDS * (2 ** (recovery_attempts - 1)),
+                               RECOVERY_BACKOFF_MAX)
             print("\n" + "=" * 60)
-            print("  🔁 AUTO-RECOVERY: Will reopen the browser in 10 seconds...")
+            print(f"  🔁 AUTO-RECOVERY {recovery_attempts}/{RECOVERY_MAX_ATTEMPTS}: "
+                  f"reopening the browser in {wait_seconds}s...")
             print("=" * 60)
-            interruptible_sleep(10, "Auto-recovery")
+            interruptible_sleep(wait_seconds, "Auto-recovery")
 
         finally:
-            # Try to close the old browser if it's still around
+            # Belt and braces: force_close_browser is idempotent, and this
+            # catches the paths that leave the loop without going through the
+            # handler above.
             if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                force_close_browser(driver, reason="round teardown")
+                driver = None
 
 
 if __name__ == "__main__":
