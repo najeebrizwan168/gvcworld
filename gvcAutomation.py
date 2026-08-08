@@ -2767,6 +2767,129 @@ PROFILE_BUSY_MARKERS = (
 )
 
 
+# webdriver_manager guards its download with a lock file created O_EXCL, and
+# deletes it only from the process that made it. Nothing is written inside it,
+# so there is no owner to check, and its acquire path has no staleness test at
+# all. Kill that process while it holds the lock — task-kill, a crash, closing
+# the app mid-download — and the file outlives it; from then on every launch
+# blocks the full 60s and dies with TimeoutError, for good, because nothing ever
+# removes it. That is exactly the "Chrome never opens" failure. The lock only
+# ever guards a download, and wdm's own timeout already caps the wait at 60s, so
+# one older than this cannot belong to a live acquisition.
+WDM_ROOT = Path.home() / ".wdm"
+WDM_LOCK_STALE_AFTER_SECONDS = 120
+
+
+def _clear_stale_driver_locks() -> int:
+    """Removes abandoned webdriver-manager locks. Returns how many went."""
+    try:
+        locks = sorted(WDM_ROOT.glob(".wdm-lock-*"))
+    except OSError:
+        return 0
+
+    cleared = 0
+    for lock in locks:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            continue
+        if age < WDM_LOCK_STALE_AFTER_SECONDS:
+            # Young enough that a second copy of the app really could be
+            # downloading behind it. Breaking that would corrupt its download.
+            debug(f"A ChromeDriver lock {age:.0f}s old is present — another launch "
+                  f"may still hold it, so it is being left alone.")
+            continue
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as err:
+            debug(f"⚠ Could not remove the abandoned ChromeDriver lock "
+                  f"{lock.name}: {err}")
+            continue
+        cleared += 1
+        debug(f"↻ Cleared an abandoned ChromeDriver lock left by an earlier run "
+              f"({age / 60:.0f} min old): {lock.name}")
+    return cleared
+
+
+# A truncated or half-extracted chromedriver.exe would satisfy is_file() and
+# then fail to start. The real binary is ~42MB.
+MIN_DRIVER_SIZE_BYTES = 1_000_000
+
+
+def _cached_driver_path(prefer_major: str = "", require_major: bool = False) -> str:
+    """
+    The best chromedriver already on disk, or "" if there is none.
+
+    With require_major, only a driver whose major matches `prefer_major` counts
+    — anything else is the wrong driver rather than a usable second choice.
+    """
+    found = []
+    try:
+        binaries = list((WDM_ROOT / "drivers" / "chromedriver").rglob("chromedriver.exe"))
+    except OSError:
+        return ""
+
+    for exe in binaries:
+        # .../drivers/chromedriver/win64/151.0.7922.77/chromedriver-win64/chromedriver.exe
+        version = ""
+        for part in exe.parts:
+            if re.fullmatch(r"\d+(\.\d+)+", part):
+                version = part
+        if not version:
+            continue
+        try:
+            if not exe.is_file() or exe.stat().st_size < MIN_DRIVER_SIZE_BYTES:
+                continue
+        except OSError:
+            continue
+        matches = bool(prefer_major) and version.split(".")[0] == prefer_major
+        if require_major and not matches:
+            continue
+        # Sorts matching-major last, then by version, so [-1] is the best one.
+        found.append((matches, [int(p) for p in version.split(".")], exe))
+
+    if not found:
+        return ""
+    found.sort()
+    return str(found[-1][2])
+
+
+def _resolve_driver_path() -> str:
+    """
+    ChromeDriver's path — from the cache first, the network only when needed.
+
+    webdriver_manager counts a cached driver as valid for one day
+    (DriverCacheManager valid_range=1) and re-downloads once it is older, even
+    when it still matches the installed Chrome exactly. That download runs while
+    holding the lock cleared above, so on a slow or blocked network it hangs with
+    the lock held — and killing it strands the lock and breaks every later launch
+    with "Timed out waiting for webdriver-manager lock". A driver whose major
+    matches Chrome is the correct driver regardless of the day it was fetched, so
+    an unchanged Chrome now costs no network call at all. The download still
+    happens when Chrome moves to a major we have no driver for.
+    """
+    _clear_stale_driver_locks()
+
+    chrome_major = _major(_chrome_version())
+    if chrome_major:
+        cached = _cached_driver_path(chrome_major, require_major=True)
+        if cached:
+            return cached
+        debug(f"No cached ChromeDriver matches Chrome {chrome_major}.x — fetching one.")
+
+    try:
+        return ChromeDriverManager().install()
+    except Exception as err:
+        debug(f"⚠ Could not resolve a ChromeDriver ({type(err).__name__}: {err}).")
+        cached = _cached_driver_path(chrome_major)
+        if not cached:
+            raise
+        debug(f"↻ Falling back to the ChromeDriver already in the cache: {cached}")
+        return cached
+
+
 def _chrome_service():
     """
     Builds the ChromeDriver service, with its verbose log pointed at a file.
@@ -2776,7 +2899,7 @@ def _chrome_service():
     names was never being written, so the cause was never recoverable after the
     fact. One file, overwritten per launch, next to the session transcripts.
     """
-    driver_path = ChromeDriverManager().install()
+    driver_path = _resolve_driver_path()
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         return Service(driver_path, log_output=str(CHROMEDRIVER_LOG),
@@ -2844,9 +2967,11 @@ def report_browser_versions():
     a failure mode we have not actually observed here.
     """
     try:
-        driver_path = ChromeDriverManager().install()
-    except Exception as err:
-        debug(f"⚠ Could not resolve a ChromeDriver ({type(err).__name__}: {err}).")
+        driver_path = _resolve_driver_path()
+    except Exception:
+        # _resolve_driver_path has already said what failed and tried the cache.
+        debug("⚠ No ChromeDriver could be resolved and none is cached, so Chrome "
+              "cannot start. Check the internet connection and try again.")
         return None
 
     driver_version = _driver_version(driver_path)
